@@ -26,7 +26,9 @@ def probe():
     modules = {}
 
     try:
-        from omni_xpu_kernel._C import sdp as _sdp
+        from omni_xpu_kernel import sdp as _sdp
+        if not _sdp.is_available():
+            raise ImportError("hardware-specific SDP sidecar is not packaged")
         sdp = _sdp
         modules["sdp"] = True
     except ImportError:

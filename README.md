@@ -21,8 +21,10 @@ No workflow or model-pipeline replacement is required.
 | Legacy fix | Global `F.interpolate` and `torch.median`/`torch.nanmedian` workarounds; disabled by default |
 
 RoPE, generic INT8 linear dispatch, and the old FP8 negative-zero wrapper are
-not registered by this custom node. Duplicating those registrations here can
-override Kitchen's constraints and fallback policy.
+normally not registered by this custom node. The A770/DG2 compatibility
+profile is the narrow exception: when Kitchen has no XPU implementation for
+`comfy_kitchen::int8_linear`, the adapter registers the Omni implementation.
+It skips registration when a Kitchen XPU backend is already present.
 
 ## Install
 
@@ -33,6 +35,9 @@ The node is bundled with the `llm-scaler-omni` ComfyUI image. It requires:
 - upstream ComfyUI.
 
 If an Intel XPU is unavailable, initialization is skipped.
+
+The A770 bridge requires the normal `comfy_kitchen` package that ships with
+ComfyUI, but does not require a separate `comfy-kitchen-xpu` installation.
 
 ## Components and switches
 
@@ -45,6 +50,7 @@ OMNIXPU_ATTENTION=0         # Disable the attention adapter
 OMNIXPU_NORM=0              # Disable the norm adapter
 OMNIXPU_FP8_GEMM=0          # Disable the temporary FP8 model/factory adapter
 OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
+OMNIXPU_KITCHEN_COMPAT=0    # Disable the A770 missing-backend bridge
 ```
 
 Validated sub-routes can be disabled independently:

@@ -58,6 +58,13 @@ COMPONENTS = (
         "adapters/int8_ffn.py",
     ),
     Component(
+        "a770_kitchen_compat",
+        "kitchen_compat",
+        "adapter",
+        "A770 compatibility",
+        "adapters/kitchen_compat.py",
+    ),
+    Component(
         "legacy_interpolate_fix",
         "interpolate_fix",
         "legacy_fix",
