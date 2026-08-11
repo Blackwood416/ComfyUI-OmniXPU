@@ -812,6 +812,16 @@ def apply():
             reasons.append("enable_gqa")
         if "scale" in kwargs:
             reasons.append("custom_scale")
+        # A770 measured negative: esimd route (permute+copy + our kernel) is
+        # ~2x slower than torch for H3-style bf16 short self-attention
+        # (seq=891). Large seq still wins on esimd, so fall back only here.
+        if (
+            _backend_name == "esimd"
+            and target == "dg2"
+            and q.dtype == torch.bfloat16
+            and q_len < 1024
+        ):
+            reasons.append(f"dg2_esimd_small_bf16_q{q_len}")
 
         selected_sdp = _backend_sdp
         selected_backend = _backend_name

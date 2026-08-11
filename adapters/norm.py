@@ -84,6 +84,17 @@ def _rms_input_2d(x):
     h = x.shape[-1]
     if h > 8192 or (h % 32 != 0 and not (_allow_h120_rms and h == 120)):
         return None
+    # A770 measured negative: the ESIMD RMSNorm kernel is ~3.8x slower than
+    # torch for many short rows (e.g. MiniMax H3 q/k norm is [S*56, 128]).
+    # Keep the native route for normal hidden widths and fall back to torch
+    # for this high-row-count short-row pattern.
+    try:
+        import omni_xpu_kernel as _omni_package
+        _is_dg2 = getattr(_omni_package, "__xpu_target__", "") == "dg2"
+    except ImportError:
+        _is_dg2 = False
+    if _is_dg2 and h == 128 and x.numel() // h >= 65536:
+        return None
     if not x.is_contiguous():
         # Lumina/Z-Image Q and K are views into a combined QKV projection. The
         # last dimension is dense, but every token has a gap after the selected
