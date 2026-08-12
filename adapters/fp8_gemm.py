@@ -22,6 +22,10 @@ _INT8_FAST_FORWARD = (
     os.environ.get("OMNIXPU_INT8_FAST_FORWARD", "1").strip().lower()
     not in ("", "0", "false", "no", "off")
 )
+_INT8_FAST_FORWARD_COPY = (
+    os.environ.get("OMNIXPU_INT8_FAST_FORWARD_COPY", "1").strip().lower()
+    not in ("", "0", "false", "no", "off")
+)
 
 
 def _log_first(msg):
@@ -70,7 +74,10 @@ def _int8_skip_reason(self, input, QuantizedTensor, TensorWiseINT8Layout):
         return f"weight_type={type(w).__name__}"
     if getattr(w, "_layout_cls", None) != "TensorWiseINT8Layout":
         return f"layout={getattr(w, '_layout_cls', None)!r}"
-    if getattr(w, "device", None) != input.device:
+    if (
+        not _INT8_FAST_FORWARD_COPY
+        and getattr(w, "device", None) != input.device
+    ):
         return (
             f"weight_device={getattr(w, 'device', None)} "
             f"input_device={input.device}"
@@ -88,9 +95,16 @@ def _int8_skip_reason(self, input, QuantizedTensor, TensorWiseINT8Layout):
     return None
 
 
+_int8_skip_logged = set()
+
+
 def _log_int8_skip(reason):
-    if reason is not None:
-        _log_first(f"int8 fast path skipped: {reason}")
+    if reason is None or reason in _int8_skip_logged:
+        return
+    if len(_int8_skip_logged) >= 10:
+        return
+    _int8_skip_logged.add(reason)
+    log.info("[OmniXPU] int8 fast path skipped: %s", reason)
 
 
 def _prepare_scale(scale, weight, input):
@@ -109,8 +123,9 @@ def apply():
     _omni_fp8_linear = probe.linear_fp8
     _omni_int8 = probe.int8
     log.info(
-        "[OmniXPU] int8 fast forward: %s",
+        "[OmniXPU] int8 fast forward: %s (copy=%s)",
         "enabled" if _INT8_FAST_FORWARD else "disabled (OMNIXPU_INT8_FAST_FORWARD=0)",
+        "on" if _INT8_FAST_FORWARD_COPY else "off",
     )
 
     import comfy.ops as comfy_ops
@@ -263,15 +278,21 @@ def apply():
                             and isinstance(w, QuantizedTensor)
                             and getattr(w, "_layout_cls", None)
                             == "TensorWiseINT8Layout"
-                            and getattr(w, "device", None) == input.device
                             and TensorWiseINT8Layout is not None
                         ):
                             qdata, scale = TensorWiseINT8Layout.get_plain_tensors(w)
-                            if (
+                            device_ok = (
                                 qdata.is_contiguous()
                                 and qdata.device == input.device
                                 and scale.device == input.device
-                            ):
+                            )
+                            if device_ok or _INT8_FAST_FORWARD_COPY:
+                                if qdata.device != input.device:
+                                    qdata = qdata.to(device=input.device)
+                                if scale.device != input.device:
+                                    scale = scale.to(device=input.device)
+                                if not qdata.is_contiguous():
+                                    qdata = qdata.contiguous()
                                 params = getattr(w, "_params", None) or getattr(
                                     w, "params", None
                                 )
@@ -314,15 +335,20 @@ def apply():
                             else:
                                 _log_int8_skip(
                                     "qdata/scale not contiguous or not on "
-                                    f"input device (qdata_device="
+                                    f"input device and copy disabled "
+                                    f"(qdata_device="
                                     f"{getattr(qdata, 'device', None)}, "
                                     f"scale_device={getattr(scale, 'device', None)})"
                                 )
                         else:
                             _log_int8_skip(
-                                _int8_skip_reason(
-                                    self, input, QuantizedTensor,
-                                    TensorWiseINT8Layout,
+                                f"shape={tuple(input.shape)} "
+                                + (
+                                    _int8_skip_reason(
+                                        self, input, QuantizedTensor,
+                                        TensorWiseINT8Layout,
+                                    )
+                                    or "unknown"
                                 )
                             )
                     except Exception as e:
@@ -331,8 +357,13 @@ def apply():
                         _log_first(f"int8 fast forward failed, falling back: {e}")
                 else:
                     _log_int8_skip(
-                        _int8_skip_reason(
-                            self, input, QuantizedTensor, TensorWiseINT8Layout
+                        f"shape={tuple(input.shape)} "
+                        + (
+                            _int8_skip_reason(
+                                self, input, QuantizedTensor,
+                                TensorWiseINT8Layout,
+                            )
+                            or "unknown"
                         )
                     )
 
