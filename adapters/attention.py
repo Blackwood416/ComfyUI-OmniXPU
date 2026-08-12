@@ -1109,6 +1109,49 @@ def apply():
                 f"cute_unsupported=dim{dim_head},q{q_len},kv{kv_len}"
             )
 
+        # A770 measured: the ESIMD D64 kernel is ~9-14x slower than torch
+        # SDPA for the MiniMax H3 VideoVAE fp16 contract (10.6ms vs 1.2ms at
+        # seq=1797; 1.45s vs 0.10s at seq=20683). The DG2 D64 sidecar path
+        # was inherited from the Xe2 tuning without an A770 re-measure; keep
+        # fp16/D64 on torch SDPA until a DG2-native D64 kernel exists.
+        if not reasons and (
+            _backend_name == "esimd"
+            and target == "dg2"
+            and q.dtype == torch.float16
+            and dim_head == 64
+            and mask is None
+        ):
+            _torch_sdpa_count += 1
+            route_call_count = _record_attention_route(
+                "dg2_torch_d64_fp16"
+            )
+            if route_call_count <= 3:
+                log.info(
+                    "[OmniXPU] attention TORCH_D64 #%d: "
+                    "heads=%d seq=%d dtype=%s",
+                    route_call_count,
+                    heads,
+                    q_len,
+                    q.dtype,
+                )
+            log_debug_event(
+                "kernel",
+                "attention",
+                {"q": q, "k": k, "v": v},
+                details={"backend": "torch", "route": "dg2_torch_d64_fp16"},
+            )
+            return _pytorch_fallback(
+                q,
+                k,
+                v,
+                heads,
+                mask=mask,
+                attn_precision=attn_precision,
+                skip_reshape=skip_reshape,
+                skip_output_reshape=skip_output_reshape,
+                **kwargs,
+            )
+
         if reasons:
             _attention_fallback_count += 1
             key = ",".join(reasons)
