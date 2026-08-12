@@ -51,6 +51,7 @@ OMNIXPU_NORM=0              # Disable the norm adapter
 OMNIXPU_FP8_GEMM=0          # Disable the temporary FP8 model/factory adapter
 OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
 OMNIXPU_KITCHEN_COMPAT=0    # Disable the A770 missing-backend bridge
+OMNIXPU_INT8_DIRECT_CAST=1  # A770 opt-in: keep offloaded TensorWise INT8 on the quantized path
 ```
 
 Validated sub-routes can be disabled independently:
@@ -82,6 +83,14 @@ OMNIXPU_MEDIAN_STRICT_INDICES=1
 `OMNIXPU_MEDIAN_STRICT_INDICES=1` reproduces the exact tie-break indices. The
 median workaround was only verified on BMG with Torch 2.10 and must not be
 enabled by default on PTL-H or another Torch version.
+
+`OMNIXPU_INT8_DIRECT_CAST=1` is an A770-only experiment for partially
+offloaded INT8 models. ComfyUI's vbar cast path can dequantize a
+TensorWise INT8 weight to bf16 before a linear, which hides the real GEMM
+cost behind page-in/cast work. The adapter moves the raw qdata/scale to XPU
+and returns a device-resident `QuantizedTensor`, so `comfy_kitchen`'s INT8
+linear path runs without the bf16 materialization. It only applies when the
+module has no LoRA/lowvram/weight functions and is off the current device.
 
 ## Adapter behavior
 
