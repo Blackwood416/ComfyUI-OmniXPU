@@ -28,6 +28,10 @@ from ..patches.debug import log_debug_event
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 _MARKER = "__omnixpu_int8_direct_cast__"
+_QuantizedTensor = None
+_TensorWiseINT8Layout = None
+_comfy_ops = None
+_original_cast = None
 
 
 def _module_eligible(s: Any, input: torch.Tensor) -> tuple[bool, str]:
@@ -48,13 +52,14 @@ def _module_eligible(s: Any, input: torch.Tensor) -> tuple[bool, str]:
     if weight.device == input.device:
         return False, "already_resident"
 
-    if (
-        getattr(s, "weight_function", None)
-        or getattr(s, "bias_function", None)
-        or getattr(s, "weight_lowvram_function", None)
-        or getattr(s, "bias_lowvram_function", None)
-    ):
-        return False, "patched_weight"
+    if getattr(s, "weight_function", None):
+        return False, "weight_function"
+    if getattr(s, "bias_function", None):
+        return False, "bias_function"
+    if getattr(s, "weight_lowvram_function", None):
+        return False, "weight_lowvram"
+    if getattr(s, "bias_lowvram_function", None):
+        return False, "bias_lowvram"
 
     qdata = getattr(weight, "_qdata", None)
     scale = getattr(getattr(weight, "_params", None), "scale", None)
@@ -76,6 +81,8 @@ def _module_eligible(s: Any, input: torch.Tensor) -> tuple[bool, str]:
 
 
 def apply():
+    global _QuantizedTensor, _TensorWiseINT8Layout, _comfy_ops, _original_cast
+
     try:
         import omni_xpu_kernel as omni_package
     except ImportError:
@@ -93,65 +100,138 @@ def apply():
     global comfy_model_management
     comfy_model_management = comfy_model_management
 
+    _QuantizedTensor = QuantizedTensor
+    _TensorWiseINT8Layout = TensorWiseINT8Layout
+    _comfy_ops = comfy_ops
+
     original_cast = comfy_ops.cast_bias_weight
+    _original_cast = original_cast
     if getattr(original_cast, _MARKER, False):
         return True, ""
-
-    def _patched_cast_bias_weight(s, input=None, dtype=None, device=None,
-                                  bias_dtype=None, offloadable=False,
-                                  compute_dtype=None, want_requant=False):
-        eligible, reason = _module_eligible(s, input)
-        if not eligible:
-            log_debug_event(
-                "dispatch",
-                "int8_direct_cast",
-                {"input": input} if isinstance(input, torch.Tensor) else {},
-                details={"hit": False, "reason": reason},
-                verbose_only=True,
-            )
-            return original_cast(
-                s,
-                input=input,
-                dtype=dtype,
-                device=device,
-                bias_dtype=bias_dtype,
-                offloadable=offloadable,
-                compute_dtype=compute_dtype,
-                want_requant=want_requant,
-            )
-
-        weight = s.weight
-        qdata, scale = TensorWiseINT8Layout.get_plain_tensors(weight)
-        target = input.device
-        qdata = qdata.to(device=target, non_blocking=True).contiguous()
-        scale = scale.to(device=target, non_blocking=True)
-        params = dataclasses.replace(weight._params, scale=scale)
-        qt = QuantizedTensor(qdata, weight._layout_cls, params)
-
-        bias = None
-        if s.bias is not None:
-            bias = s.bias.to(
-                device=target,
-                dtype=bias_dtype if bias_dtype is not None else dtype,
-                non_blocking=True,
-            )
-
-        log_debug_event(
-            "dispatch",
-            "int8_direct_cast",
-            {"input": input, "weight": qdata, "weight_scale": scale, "bias": bias},
-            details={
-                "hit": True,
-                "reason": reason,
-                "qdata_bytes": qdata.numel() * qdata.element_size(),
-            },
-            verbose_only=True,
-        )
-        # offload_stream is intentionally None: we did not touch the vbar
-        # pin, so uncast_bias_weight has nothing to wait for or unpin.
-        return qt, bias, (None, None, None)
 
     setattr(_patched_cast_bias_weight, _MARKER, True)
     comfy_ops.cast_bias_weight = _patched_cast_bias_weight
     log.info("[OmniXPU] A770: INT8 direct cast enabled for offloaded TensorWise weights")
     return True, ""
+
+
+def _direct_cast_bias_weight(s, input, dtype, bias_dtype):
+    weight = s.weight
+    qdata, scale = _TensorWiseINT8Layout.get_plain_tensors(weight)
+    target = input.device
+    qdata = qdata.to(device=target, non_blocking=True).contiguous()
+    scale = scale.to(device=target, non_blocking=True)
+    params = dataclasses.replace(weight._params, scale=scale)
+    qt = _QuantizedTensor(qdata, weight._layout_cls, params)
+
+    bias = None
+    if s.bias is not None:
+        bias = s.bias.to(
+            device=target,
+            dtype=bias_dtype if bias_dtype is not None else dtype,
+            non_blocking=True,
+        )
+
+    log_debug_event(
+        "dispatch",
+        "int8_direct_cast",
+        {"input": input, "weight": qdata, "weight_scale": scale, "bias": bias},
+        details={
+            "hit": True,
+            "reason": "raw_qdata",
+            "qdata_bytes": qdata.numel() * qdata.element_size(),
+        },
+        verbose_only=True,
+    )
+    # offload_stream is intentionally None: we did not touch the vbar
+    # pin, so uncast_bias_weight has nothing to wait for or unpin.
+    return qt, bias, (None, None, None)
+
+
+def _cached_patched_weight(s, input, dtype, bias_dtype):
+    """Return a cached/requantized patched TensorWise INT8 weight."""
+    cache = getattr(s, "_omnixpu_patched_cache", None)
+    if cache is not None:
+        qdata_cpu, scale_cpu, bias_cpu, params = cache
+        qdata = qdata_cpu.to(input.device, non_blocking=True)
+        scale = scale_cpu.to(input.device, non_blocking=True)
+        params = dataclasses.replace(params, scale=scale)
+        qt = _QuantizedTensor(qdata, "TensorWiseINT8Layout", params)
+        bias = None
+        if bias_cpu is not None:
+            bias = bias_cpu.to(
+                input.device,
+                dtype=bias_dtype if bias_dtype is not None else dtype,
+                non_blocking=True,
+            )
+        return qt, bias, (None, None, None)
+
+    weight, bias, offload_stream = _original_cast(
+        s,
+        input=input,
+        dtype=dtype,
+        device=input.device,
+        bias_dtype=bias_dtype,
+        offloadable=True,
+        compute_dtype=dtype,
+        want_requant=True,
+    )
+    if not isinstance(weight, torch.Tensor) or weight.dim() != 2:
+        if offload_stream is not None:
+            _comfy_ops.uncast_bias_weight(s, weight, bias, offload_stream)
+        return None, "unexpected_patched_weight"
+
+    qdata, params = _TensorWiseINT8Layout.quantize(
+        weight, per_channel=True, stochastic_rounding=0
+    )
+    bias_cpu = bias.detach().cpu() if bias is not None else None
+    s._omnixpu_patched_cache = (
+        qdata.detach().cpu(),
+        params.scale.detach().cpu(),
+        bias_cpu,
+        params,
+    )
+    if offload_stream is not None:
+        _comfy_ops.uncast_bias_weight(s, weight, bias, offload_stream)
+
+    qt = _QuantizedTensor(qdata, "TensorWiseINT8Layout", params)
+    return qt, bias, (None, None, None)
+
+
+def _patched_cast_bias_weight(s, input=None, dtype=None, device=None,
+                              bias_dtype=None, offloadable=False,
+                              compute_dtype=None, want_requant=False):
+    eligible, reason = _module_eligible(s, input)
+    if eligible:
+        return _direct_cast_bias_weight(s, input, dtype, bias_dtype)
+    if (
+        reason == "weight_function"
+        and not getattr(s, "bias_function", None)
+        and not getattr(s, "weight_lowvram_function", None)
+        and not getattr(s, "bias_lowvram_function", None)
+    ):
+        result = _cached_patched_weight(s, input, dtype, bias_dtype)
+        if result is not None and result[0] is not None:
+            log_debug_event(
+                "dispatch",
+                "int8_direct_cast",
+                {"input": input, "weight": result[0]._qdata},
+                details={
+                    "hit": True,
+                    "reason": "patched_weight_cached",
+                    "qdata_bytes": result[0]._qdata.numel()
+                    * result[0]._qdata.element_size(),
+                },
+                verbose_only=True,
+            )
+            return result
+    return _original_cast(
+        s,
+        input=input,
+        dtype=dtype,
+        device=device,
+        bias_dtype=bias_dtype,
+        offloadable=offloadable,
+        compute_dtype=compute_dtype,
+        want_requant=want_requant,
+    )
