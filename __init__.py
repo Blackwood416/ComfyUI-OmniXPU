@@ -50,6 +50,10 @@ try:
         NODE_CLASS_MAPPINGS["OmniXPUStatus"] = diag.OmniXPUStatus
         NODE_DISPLAY_NAME_MAPPINGS["OmniXPUStatus"] = "OmniXPU Status"
 
+        sdp_cache = _load("nodes/sdp_cache.py", f"{_PKG}.nodes.sdp_cache")
+        NODE_CLASS_MAPPINGS.update(sdp_cache.NODE_CLASS_MAPPINGS)
+        NODE_DISPLAY_NAME_MAPPINGS.update(sdp_cache.NODE_DISPLAY_NAME_MAPPINGS)
+
 except Exception as e:
     import traceback
     log.error("[OmniXPU] Initialization failed: %s\n%s", e, traceback.format_exc())
