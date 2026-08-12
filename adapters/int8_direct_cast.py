@@ -149,14 +149,15 @@ def _direct_cast_bias_weight(s, input, dtype, bias_dtype):
 
 
 def _cached_patched_weight(s, input, dtype, bias_dtype):
-    """Return a cached/requantized patched TensorWise INT8 weight."""
+    """Return a cached patched bf16 weight (no per-step LoRA recompute)."""
     cache = getattr(s, "_omnixpu_patched_cache", None)
     if cache is not None:
-        qdata_cpu, scale_cpu, bias_cpu, params = cache
-        qdata = qdata_cpu.to(input.device, non_blocking=True)
-        scale = scale_cpu.to(input.device, non_blocking=True)
-        params = dataclasses.replace(params, scale=scale)
-        qt = _QuantizedTensor(qdata, "TensorWiseINT8Layout", params)
+        weight_cpu, bias_cpu = cache
+        weight = weight_cpu.to(
+            input.device,
+            dtype=dtype,
+            non_blocking=True,
+        )
         bias = None
         if bias_cpu is not None:
             bias = bias_cpu.to(
@@ -164,7 +165,7 @@ def _cached_patched_weight(s, input, dtype, bias_dtype):
                 dtype=bias_dtype if bias_dtype is not None else dtype,
                 non_blocking=True,
             )
-        return qt, bias, (None, None, None)
+        return weight, bias, (None, None, None)
 
     weight, bias, offload_stream = _original_cast(
         s,
@@ -181,21 +182,13 @@ def _cached_patched_weight(s, input, dtype, bias_dtype):
             _comfy_ops.uncast_bias_weight(s, weight, bias, offload_stream)
         return None, "unexpected_patched_weight"
 
-    qdata, params = _TensorWiseINT8Layout.quantize(
-        weight, per_channel=True, stochastic_rounding=0
-    )
+    weight_cpu = weight.detach().cpu()
     bias_cpu = bias.detach().cpu() if bias is not None else None
-    s._omnixpu_patched_cache = (
-        qdata.detach().cpu(),
-        params.scale.detach().cpu(),
-        bias_cpu,
-        params,
-    )
+    s._omnixpu_patched_cache = (weight_cpu, bias_cpu)
     if offload_stream is not None:
         _comfy_ops.uncast_bias_weight(s, weight, bias, offload_stream)
 
-    qt = _QuantizedTensor(qdata, "TensorWiseINT8Layout", params)
-    return qt, bias, (None, None, None)
+    return weight, bias, (None, None, None)
 
 
 def _patched_cast_bias_weight(s, input=None, dtype=None, device=None,
@@ -215,12 +208,12 @@ def _patched_cast_bias_weight(s, input=None, dtype=None, device=None,
             log_debug_event(
                 "dispatch",
                 "int8_direct_cast",
-                {"input": input, "weight": result[0]._qdata},
+                {"input": input, "weight": result[0]},
                 details={
                     "hit": True,
                     "reason": "patched_weight_cached",
-                    "qdata_bytes": result[0]._qdata.numel()
-                    * result[0]._qdata.element_size(),
+                    "weight_bytes": result[0].numel()
+                    * result[0].element_size(),
                 },
                 verbose_only=True,
             )

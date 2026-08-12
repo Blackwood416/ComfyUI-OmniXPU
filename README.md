@@ -92,9 +92,9 @@ and returns a device-resident `QuantizedTensor`, so `comfy_kitchen`'s INT8
 linear path runs without the bf16 materialization. It only applies when the
 module has no LoRA/lowvram/weight functions and is off the current device.
 For modules with a LoRA `weight_function`, the first cast still computes the
-patched bf16 weight, but the result is re-quantized to TensorWise INT8 and
-cached on CPU; later sampling steps reuse the cached patched qdata instead
-of recomputing the LoRA every step.
+patched bf16 weight, but the result is cached on CPU; later sampling steps
+reuse the cached patched bf16 weight instead of recomputing the LoRA every
+step.
 
 ## Adapter behavior
 
