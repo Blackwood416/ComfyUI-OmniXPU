@@ -15,6 +15,9 @@ class Config:
         self.norm = master and os.environ.get("OMNIXPU_NORM", "1") != "0"
         self.fp8_gemm = master and os.environ.get("OMNIXPU_FP8_GEMM", "1") != "0"
         self.int8_ffn = master and os.environ.get("OMNIXPU_INT8_FFN", "1") != "0"
+        self.int8_direct_cast = (
+            master and os.environ.get("OMNIXPU_INT8_DIRECT_CAST", "0") != "0"
+        )
         self.kitchen_compat = (
             master and os.environ.get("OMNIXPU_KITCHEN_COMPAT", "1") != "0"
         )

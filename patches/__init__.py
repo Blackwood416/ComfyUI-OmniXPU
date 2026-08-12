@@ -65,6 +65,13 @@ COMPONENTS = (
         "adapters/kitchen_compat.py",
     ),
     Component(
+        "a770_int8_direct_cast",
+        "int8_direct_cast",
+        "adapter",
+        "A770 compatibility",
+        "adapters/int8_direct_cast.py",
+    ),
+    Component(
         "legacy_interpolate_fix",
         "interpolate_fix",
         "legacy_fix",
