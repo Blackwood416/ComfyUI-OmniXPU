@@ -26,6 +26,9 @@ _INT8_FAST_FORWARD_COPY = (
     os.environ.get("OMNIXPU_INT8_FAST_FORWARD_COPY", "1").strip().lower()
     not in ("", "0", "false", "no", "off")
 )
+_INT8_FAST_FORWARD_COPY_MIN_ELEMS = int(
+    os.environ.get("OMNIXPU_INT8_FAST_FORWARD_COPY_MIN_ELEMS", str(16 * 1024 * 1024))
+)
 
 
 def _log_first(msg):
@@ -74,13 +77,15 @@ def _int8_skip_reason(self, input, QuantizedTensor, TensorWiseINT8Layout):
         return f"weight_type={type(w).__name__}"
     if getattr(w, "_layout_cls", None) != "TensorWiseINT8Layout":
         return f"layout={getattr(w, '_layout_cls', None)!r}"
-    if (
+    if getattr(w, "device", None) != input.device and (
         not _INT8_FAST_FORWARD_COPY
-        and getattr(w, "device", None) != input.device
+        or input.numel() < _INT8_FAST_FORWARD_COPY_MIN_ELEMS
     ):
         return (
             f"weight_device={getattr(w, 'device', None)} "
-            f"input_device={input.device}"
+            f"input_device={input.device} "
+            f"input_elems={input.numel()} "
+            f"copy_min_elems={_INT8_FAST_FORWARD_COPY_MIN_ELEMS}"
         )
     try:
         qdata, scale = TensorWiseINT8Layout.get_plain_tensors(w)
@@ -123,9 +128,10 @@ def apply():
     _omni_fp8_linear = probe.linear_fp8
     _omni_int8 = probe.int8
     log.info(
-        "[OmniXPU] int8 fast forward: %s (copy=%s)",
+        "[OmniXPU] int8 fast forward: %s (copy=%s, copy_min_elems=%d)",
         "enabled" if _INT8_FAST_FORWARD else "disabled (OMNIXPU_INT8_FAST_FORWARD=0)",
         "on" if _INT8_FAST_FORWARD_COPY else "off",
+        _INT8_FAST_FORWARD_COPY_MIN_ELEMS,
     )
 
     import comfy.ops as comfy_ops
@@ -286,7 +292,12 @@ def apply():
                                 and qdata.device == input.device
                                 and scale.device == input.device
                             )
-                            if device_ok or _INT8_FAST_FORWARD_COPY:
+                            copy_ok = (
+                                _INT8_FAST_FORWARD_COPY
+                                and input_2d.numel()
+                                >= _INT8_FAST_FORWARD_COPY_MIN_ELEMS
+                            )
+                            if device_ok or copy_ok:
                                 if qdata.device != input.device:
                                     qdata = qdata.to(device=input.device)
                                 if scale.device != input.device:
@@ -338,7 +349,10 @@ def apply():
                                     f"input device and copy disabled "
                                     f"(qdata_device="
                                     f"{getattr(qdata, 'device', None)}, "
-                                    f"scale_device={getattr(scale, 'device', None)})"
+                                    f"scale_device={getattr(scale, 'device', None)}, "
+                                    f"input_elems={input_2d.numel()}, "
+                                    f"copy_min_elems="
+                                    f"{_INT8_FAST_FORWARD_COPY_MIN_ELEMS})"
                                 )
                         else:
                             _log_int8_skip(
