@@ -1,10 +1,11 @@
 """Patch comfy.ops fp8_linear and mixed_precision_ops to use
-omni_xpu_kernel's oneDNN W8A16 FP8 GEMM when running on XPU.
+omni_xpu_kernel's oneDNN W8A16 FP8 / INT8 GEMMs when running on XPU.
 
 Exactly mirrors the logic from comfyui_for_multi_arc.patch.
 """
 
 import logging
+import os
 
 import torch
 import comfy.model_management
@@ -15,7 +16,12 @@ from .errors import is_fatal_accelerator_error
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 _omni_fp8_linear = None
+_omni_int8 = None
 _logged_first_use = False
+_INT8_FAST_FORWARD = (
+    os.environ.get("OMNIXPU_INT8_FAST_FORWARD", "1").strip().lower()
+    not in ("", "0", "false", "no", "off")
+)
 
 
 def _log_first(msg):
@@ -44,12 +50,13 @@ def _prepare_scale(scale, weight, input):
 
 
 def apply():
-    global _omni_fp8_linear
+    global _omni_fp8_linear, _omni_int8
     import sys
     probe = sys.modules.get("ComfyUI-OmniXPU.probe")
     if probe.linear_fp8 is None:
         return False, "omni_xpu_kernel linear_fp8 not available"
     _omni_fp8_linear = probe.linear_fp8
+    _omni_int8 = probe.int8
 
     import comfy.ops as comfy_ops
 
@@ -116,6 +123,7 @@ def apply():
     if hasattr(comfy_ops, "mixed_precision_ops"):
         _orig_mixed = comfy_ops.mixed_precision_ops
         QuantizedTensor = getattr(comfy_ops, "QuantizedTensor", None)
+        TensorWiseINT8Layout = getattr(comfy_ops, "TensorWiseINT8Layout", None)
 
         def _patched_mixed(*args, **kwargs):
             klass = _orig_mixed(*args, **kwargs)
@@ -162,6 +170,97 @@ def apply():
                     details=_dispatch_details(self),
                     verbose_only=True,
                 )
+                # INT8 fast path (A770/DG2): call the omni oneDNN s8 GEMM
+                # directly instead of going through
+                # QuantizedTensor.from_float -> cast_bias_weight -> torch
+                # dispatch. The original path quantizes the activation, hands
+                # it to a kernel that dequantizes it back to the compute dtype,
+                # and our registered kernel then re-quantizes rowwise; that
+                # round trip is pure overhead for TensorWise INT8. Mirror the
+                # exact conditions linear_input_act uses for its fused path:
+                # quantized TensorWise INT8 weight, no LoRA functions, no AWQ
+                # smoothing / static input scale, weight resident on XPU.
+                if (
+                    _INT8_FAST_FORWARD
+                    and
+                    _omni_int8 is not None
+                    and input.is_xpu
+                    and len(self.weight_function) == 0
+                    and len(self.bias_function) == 0
+                    and getattr(self, "quant_format", None) == "int8_tensorwise"
+                    and not getattr(self, "_full_precision_mm", False)
+                    and not getattr(self, "comfy_force_cast_weights", False)
+                    and getattr(self, "pre_quant_scale", None) is None
+                    and getattr(self, "input_scale", None) is None
+                ):
+                    try:
+                        comfy_ops.run_every_op()
+                        input_shape = input.shape
+                        input_2d = (
+                            input.reshape(-1, input_shape[-1])
+                            if input.ndim >= 3
+                            else input
+                        )
+                        w = self.weight
+                        if (
+                            input_2d.ndim == 2
+                            and QuantizedTensor is not None
+                            and isinstance(w, QuantizedTensor)
+                            and getattr(w, "_layout_cls", None)
+                            == "TensorWiseINT8Layout"
+                            and getattr(w, "device", None) == input.device
+                            and TensorWiseINT8Layout is not None
+                        ):
+                            qdata, scale = TensorWiseINT8Layout.get_plain_tensors(w)
+                            if (
+                                qdata.is_contiguous()
+                                and qdata.device == input.device
+                                and scale.device == input.device
+                            ):
+                                params = getattr(w, "_params", None) or getattr(
+                                    w, "params", None
+                                )
+                                bias = None
+                                if self.bias is not None:
+                                    bias = comfy.model_management.cast_to_device(
+                                        self.bias, input.device, input.dtype
+                                    )
+                                out = _omni_int8.int8_linear(
+                                    input_2d,
+                                    qdata,
+                                    scale,
+                                    bias,
+                                    out_dtype=input.dtype,
+                                    convrot=bool(getattr(params, "convrot", False)),
+                                    convrot_groupsize=int(
+                                        getattr(params, "convrot_groupsize", 256)
+                                    ),
+                                    input_act=None,
+                                )
+                                if out is not None:
+                                    log_debug_event(
+                                        "kernel",
+                                        "int8_linear",
+                                        {
+                                            "x": input_2d,
+                                            "weight": qdata,
+                                            "weight_scale": scale,
+                                            "bias": bias,
+                                        },
+                                        details={
+                                            "backend": "omni_dg2_compat_fast"
+                                        },
+                                    )
+                                    if input.ndim >= 3:
+                                        out = out.reshape(
+                                            *input_shape[:-1], -1
+                                        )
+                                    return out
+                    except Exception as e:
+                        if is_fatal_accelerator_error(e):
+                            raise
+                        _log_first(f"int8 fast forward failed, falling back: {e}")
+
                 if (_omni_fp8_linear is not None and input.is_xpu and
                         getattr(self, 'quant_format', None) in ('float8_e4m3fn', 'float8_e5m2') and
                         len(self.weight_function) == 0 and len(self.bias_function) == 0):
