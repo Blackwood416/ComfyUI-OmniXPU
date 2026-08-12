@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from typing import Any
 
 import torch
@@ -202,6 +203,8 @@ def _patched_cast_bias_weight(s, input=None, dtype=None, device=None,
         and not getattr(s, "bias_function", None)
         and not getattr(s, "weight_lowvram_function", None)
         and not getattr(s, "bias_lowvram_function", None)
+        and os.environ.get("OMNIXPU_INT8_PATCH_CACHE", "0").strip().lower()
+        not in ("", "0", "false", "no", "off")
     ):
         result = _cached_patched_weight(s, input, dtype, bias_dtype)
         if result is not None and result[0] is not None:

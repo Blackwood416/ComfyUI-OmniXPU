@@ -18,6 +18,9 @@ class Config:
         self.int8_direct_cast = (
             master and os.environ.get("OMNIXPU_INT8_DIRECT_CAST", "0") != "0"
         )
+        self.int8_patch_cache = (
+            master and os.environ.get("OMNIXPU_INT8_PATCH_CACHE", "0") != "0"
+        )
         self.kitchen_compat = (
             master and os.environ.get("OMNIXPU_KITCHEN_COMPAT", "1") != "0"
         )

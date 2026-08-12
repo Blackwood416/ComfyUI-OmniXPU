@@ -52,6 +52,7 @@ OMNIXPU_FP8_GEMM=0          # Disable the temporary FP8 model/factory adapter
 OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
 OMNIXPU_KITCHEN_COMPAT=0    # Disable the A770 missing-backend bridge
 OMNIXPU_INT8_DIRECT_CAST=1  # A770 opt-in: keep offloaded TensorWise INT8 on the quantized path
+OMNIXPU_INT8_PATCH_CACHE=1  # A770 opt-in: cache patched bf16 weights across sampling steps
 ```
 
 Validated sub-routes can be disabled independently:
@@ -94,7 +95,9 @@ module has no LoRA/lowvram/weight functions and is off the current device.
 For modules with a LoRA `weight_function`, the first cast still computes the
 patched bf16 weight, but the result is cached on CPU; later sampling steps
 reuse the cached patched bf16 weight instead of recomputing the LoRA every
-step.
+step. This is separate (`OMNIXPU_INT8_PATCH_CACHE=1`) because early
+measurements showed it can regress under VRAM pressure; leave it off unless
+you are A/B testing that specific cache.
 
 ## Adapter behavior
 
