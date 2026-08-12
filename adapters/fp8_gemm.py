@@ -42,6 +42,57 @@ def _dispatch_details(module):
     }
 
 
+def _int8_skip_reason(self, input, QuantizedTensor, TensorWiseINT8Layout):
+    """Return why the INT8 fast forward did not take this call (or None)."""
+    if not _INT8_FAST_FORWARD:
+        return "env_disabled"
+    if _omni_int8 is None:
+        return "omni_int8_unavailable"
+    if not input.is_xpu:
+        return "input_not_xpu"
+    if len(self.weight_function):
+        return f"weight_function={len(self.weight_function)}"
+    if len(self.bias_function):
+        return f"bias_function={len(self.bias_function)}"
+    qf = getattr(self, "quant_format", None)
+    if qf != "int8_tensorwise":
+        return f"quant_format={qf!r}"
+    if getattr(self, "_full_precision_mm", False):
+        return "full_precision_mm"
+    if getattr(self, "comfy_force_cast_weights", False):
+        return "comfy_force_cast_weights"
+    if getattr(self, "pre_quant_scale", None) is not None:
+        return "pre_quant_scale_set"
+    if getattr(self, "input_scale", None) is not None:
+        return "input_scale_set"
+    w = self.weight
+    if not isinstance(w, QuantizedTensor):
+        return f"weight_type={type(w).__name__}"
+    if getattr(w, "_layout_cls", None) != "TensorWiseINT8Layout":
+        return f"layout={getattr(w, '_layout_cls', None)!r}"
+    if getattr(w, "device", None) != input.device:
+        return (
+            f"weight_device={getattr(w, 'device', None)} "
+            f"input_device={input.device}"
+        )
+    try:
+        qdata, scale = TensorWiseINT8Layout.get_plain_tensors(w)
+    except Exception as e:
+        return f"get_plain_tensors_error={e}"
+    if not qdata.is_contiguous():
+        return "qdata_not_contiguous"
+    if qdata.device != input.device:
+        return f"qdata_device={qdata.device}"
+    if scale.device != input.device:
+        return f"scale_device={scale.device}"
+    return None
+
+
+def _log_int8_skip(reason):
+    if reason is not None:
+        _log_first(f"int8 fast path skipped: {reason}")
+
+
 def _prepare_scale(scale, weight, input):
     scale = torch.as_tensor(scale, device=input.device, dtype=torch.float32).reshape(-1)
     if scale.numel() == 1:
@@ -57,6 +108,10 @@ def apply():
         return False, "omni_xpu_kernel linear_fp8 not available"
     _omni_fp8_linear = probe.linear_fp8
     _omni_int8 = probe.int8
+    log.info(
+        "[OmniXPU] int8 fast forward: %s",
+        "enabled" if _INT8_FAST_FORWARD else "disabled (OMNIXPU_INT8_FAST_FORWARD=0)",
+    )
 
     import comfy.ops as comfy_ops
 
@@ -256,10 +311,30 @@ def apply():
                                             *input_shape[:-1], -1
                                         )
                                     return out
+                            else:
+                                _log_int8_skip(
+                                    "qdata/scale not contiguous or not on "
+                                    f"input device (qdata_device="
+                                    f"{getattr(qdata, 'device', None)}, "
+                                    f"scale_device={getattr(scale, 'device', None)})"
+                                )
+                        else:
+                            _log_int8_skip(
+                                _int8_skip_reason(
+                                    self, input, QuantizedTensor,
+                                    TensorWiseINT8Layout,
+                                )
+                            )
                     except Exception as e:
                         if is_fatal_accelerator_error(e):
                             raise
                         _log_first(f"int8 fast forward failed, falling back: {e}")
+                else:
+                    _log_int8_skip(
+                        _int8_skip_reason(
+                            self, input, QuantizedTensor, TensorWiseINT8Layout
+                        )
+                    )
 
                 if (_omni_fp8_linear is not None and input.is_xpu and
                         getattr(self, 'quant_format', None) in ('float8_e4m3fn', 'float8_e5m2') and
