@@ -85,7 +85,7 @@ median workaround was only verified on BMG with Torch 2.10 and must not be
 enabled by default on PTL-H or another Torch version.
 
 `OMNIXPU_INT8_DIRECT_CAST=1` is an A770-only experiment for partially
-offloaded INT8 models. ComfyUI's vbar cast path can dequantize a
+offloaded INT8 models. ComfyUI's offload cast path can dequantize a
 TensorWise INT8 weight to bf16 before a linear, which hides the real GEMM
 cost behind page-in/cast work. The adapter moves the raw qdata/scale to XPU
 and returns a device-resident `QuantizedTensor`, so `comfy_kitchen`'s INT8

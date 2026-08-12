@@ -1,6 +1,7 @@
 """A770: keep offloaded TensorWise INT8 weights on the quantized path.
 
-ComfyUI's vbar/AIMDO cast path dequantizes a TensorWise INT8 weight whenever
+ComfyUI's offload cast path (vbar/AIMDO or regular lowvram) dequantizes a
+TensorWise INT8 weight whenever
 the storage dtype differs from the compute dtype and no lowvram requant hook
 is present.  That sends long-sequence H3 MLP/attention projections through
 ``dequantize + bf16 F.linear`` and hides the real GEMM cost behind page-in and
@@ -46,8 +47,6 @@ def _module_eligible(s: Any, input: torch.Tensor) -> tuple[bool, str]:
         return False, "transposed_weight"
     if weight.device == input.device:
         return False, "already_resident"
-    if not hasattr(s, "_v"):
-        return False, "not_vbar"
 
     if (
         getattr(s, "weight_function", None)
