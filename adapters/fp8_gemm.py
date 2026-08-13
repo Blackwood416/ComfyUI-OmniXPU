@@ -29,6 +29,14 @@ _INT8_FAST_FORWARD_COPY = (
 _INT8_FAST_FORWARD_COPY_MIN_ELEMS = int(
     os.environ.get("OMNIXPU_INT8_FAST_FORWARD_COPY_MIN_ELEMS", str(16 * 1024 * 1024))
 )
+_INT8_QDATA_CACHE = (
+    os.environ.get("OMNIXPU_INT8_QDATA_CACHE", "1").strip().lower()
+    not in ("", "0", "false", "no", "off")
+)
+_INT8_QDATA_CACHE_MAX = int(
+    os.environ.get("OMNIXPU_INT8_QDATA_CACHE_MAX", "12")
+)
+_int8_qdata_cache = {}
 
 
 def _log_first(msg):
@@ -112,6 +120,47 @@ def _log_int8_skip(reason):
     log.info("[OmniXPU] int8 fast path skipped: %s", reason)
 
 
+def _int8_qdata_cached(qtensor, device, TensorWiseINT8Layout):
+    """Return cached XPU copies of a TensorWise INT8 weight's plain tensors.
+
+    H3 sampling reuses the same quantized weights for every block, but the
+    vbar-resident module keeps its qdata on CPU, so the fast path would
+    otherwise re-copy 116-154 MiB per Linear call (about 386 MiB per block).
+    Cache the XPU copies keyed by module identity + storage identity, holding
+    the owner alive so ``id()`` cannot be recycled. In-place mutation of a
+    live weight would go stale; that path is rare (set_weight/requant during
+    sampling) and the LoRA path is excluded from the fast path anyway.
+    OMNIXPU_INT8_QDATA_CACHE=0 disables the cache.
+    """
+    key = (
+        id(qtensor),
+        qtensor._qdata.data_ptr(),
+        tuple(qtensor._qdata.shape),
+        str(qtensor._qdata.dtype),
+        qtensor._params.scale.data_ptr(),
+        tuple(qtensor._params.scale.shape),
+    )
+    entry = _int8_qdata_cache.get(key)
+    if entry is not None:
+        qdata, scale, owner = entry
+        if qdata.device == device:
+            # LRU touch: re-insert to move to the end.
+            _int8_qdata_cache.pop(key)
+            _int8_qdata_cache[key] = (qdata, scale, owner)
+            return qdata, scale
+        _int8_qdata_cache.pop(key, None)
+
+    qdata, scale = TensorWiseINT8Layout.get_plain_tensors(qtensor)
+    qdata_x = qdata.to(device=device)
+    scale_x = scale.to(device=device)
+    if not qdata_x.is_contiguous():
+        qdata_x = qdata_x.contiguous()
+    _int8_qdata_cache[key] = (qdata_x, scale_x, qtensor)
+    while len(_int8_qdata_cache) > _INT8_QDATA_CACHE_MAX:
+        _int8_qdata_cache.pop(next(iter(_int8_qdata_cache)))
+    return qdata_x, scale_x
+
+
 def _prepare_scale(scale, weight, input):
     scale = torch.as_tensor(scale, device=input.device, dtype=torch.float32).reshape(-1)
     if scale.numel() == 1:
@@ -128,10 +177,12 @@ def apply():
     _omni_fp8_linear = probe.linear_fp8
     _omni_int8 = probe.int8
     log.info(
-        "[OmniXPU] int8 fast forward: %s (copy=%s, copy_min_elems=%d)",
+        "[OmniXPU] int8 fast forward: %s (copy=%s, copy_min_elems=%d, "
+        "qdata_cache=%s)",
         "enabled" if _INT8_FAST_FORWARD else "disabled (OMNIXPU_INT8_FAST_FORWARD=0)",
         "on" if _INT8_FAST_FORWARD_COPY else "off",
         _INT8_FAST_FORWARD_COPY_MIN_ELEMS,
+        "on" if _INT8_QDATA_CACHE else "off",
     )
 
     import comfy.ops as comfy_ops
@@ -298,12 +349,17 @@ def apply():
                                 >= _INT8_FAST_FORWARD_COPY_MIN_ELEMS
                             )
                             if device_ok or copy_ok:
-                                if qdata.device != input.device:
-                                    qdata = qdata.to(device=input.device)
-                                if scale.device != input.device:
-                                    scale = scale.to(device=input.device)
-                                if not qdata.is_contiguous():
-                                    qdata = qdata.contiguous()
+                                if _INT8_QDATA_CACHE and not device_ok:
+                                    qdata, scale = _int8_qdata_cached(
+                                        w, input.device, TensorWiseINT8Layout
+                                    )
+                                else:
+                                    if qdata.device != input.device:
+                                        qdata = qdata.to(device=input.device)
+                                    if scale.device != input.device:
+                                        scale = scale.to(device=input.device)
+                                    if not qdata.is_contiguous():
+                                        qdata = qdata.contiguous()
                                 params = getattr(w, "_params", None) or getattr(
                                     w, "params", None
                                 )
