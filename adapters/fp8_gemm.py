@@ -487,4 +487,90 @@ def apply():
 
         comfy_ops.mixed_precision_ops = _patched_mixed
 
+        # -- Intercept 3: linear_input_act (SwiGLU + down projection) --------
+        # MiniMax H3's MLP runs fc2 through comfy.ops.linear_input_act, which
+        # calls cast_bias_weight (vbar page-in + sync) and the comfy_kitchen
+        # registry int8_linear on every block. Route it through the same
+        # cached-qdata fast path when the weight is a TensorWise INT8
+        # QuantizedTensor and the activation is large enough to amortize the
+        # H2D copy (or the weight is already XPU-resident).
+        _orig_linear_input_act = comfy_ops.linear_input_act
+
+        def _patched_linear_input_act(linear, x, input_act):
+            if (
+                _INT8_FAST_FORWARD
+                and _omni_int8 is not None
+                and x.is_xpu
+                and input_act == "swiglu"
+                and len(getattr(linear, "weight_function", ())) == 0
+                and len(getattr(linear, "bias_function", ())) == 0
+                and QuantizedTensor is not None
+                and TensorWiseINT8Layout is not None
+                and isinstance(linear.weight, QuantizedTensor)
+                and getattr(linear.weight, "_layout_cls", None)
+                == "TensorWiseINT8Layout"
+                and getattr(linear, "quant_format", None) == "int8_tensorwise"
+            ):
+                try:
+                    qdata, scale = linear.weight._qdata, linear.weight._params.scale
+                    device_ok = (
+                        qdata.device == x.device and scale.device == x.device
+                    )
+                    copy_ok = (
+                        _INT8_FAST_FORWARD_COPY
+                        and x.numel() >= _INT8_FAST_FORWARD_COPY_MIN_ELEMS
+                    )
+                    if device_ok or copy_ok:
+                        if _INT8_QDATA_CACHE and not device_ok:
+                            qdata, scale = _int8_qdata_cached(
+                                linear.weight, x.device, TensorWiseINT8Layout
+                            )
+                        else:
+                            if qdata.device != x.device:
+                                qdata = qdata.to(device=x.device)
+                            if scale.device != x.device:
+                                scale = scale.to(device=x.device)
+                        params = linear.weight._params
+                        bias = None
+                        if linear.bias is not None:
+                            bias = comfy.model_management.cast_to_device(
+                                linear.bias, x.device, x.dtype
+                            )
+                        out = _omni_int8.int8_linear(
+                            x,
+                            qdata,
+                            scale,
+                            bias,
+                            out_dtype=x.dtype,
+                            convrot=bool(getattr(params, "convrot", False)),
+                            convrot_groupsize=int(
+                                getattr(params, "convrot_groupsize", 256)
+                            ),
+                            input_act=input_act,
+                        )
+                        if out is not None:
+                            log_debug_event(
+                                "kernel",
+                                "int8_linear",
+                                {
+                                    "x": x,
+                                    "weight": qdata,
+                                    "weight_scale": scale,
+                                    "bias": bias,
+                                },
+                                details={
+                                    "backend": "omni_dg2_compat_fast_fc2"
+                                },
+                            )
+                            return out
+                except Exception as e:
+                    if is_fatal_accelerator_error(e):
+                        raise
+                    _log_first(
+                        f"int8 fast linear_input_act failed, falling back: {e}"
+                    )
+            return _orig_linear_input_act(linear, x, input_act)
+
+        comfy_ops.linear_input_act = _patched_linear_input_act
+
     return True, None
