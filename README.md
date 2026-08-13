@@ -12,6 +12,10 @@ The runtime is deliberately split into three layers:
 
 No workflow or model-pipeline replacement is required.
 
+This repository is the standalone home of the custom node, extracted from
+[intel/llm-scaler](https://github.com/intel/llm-scaler). The node is also
+bundled with the `llm-scaler-omni` ComfyUI image.
+
 ## Ownership
 
 | Layer | Current responsibility |
@@ -28,9 +32,19 @@ It skips registration when a Kitchen XPU backend is already present.
 
 ## Install
 
-The node is bundled with the `llm-scaler-omni` ComfyUI image. It requires:
+Install as a ComfyUI custom node (no tag needed; update with `git pull`):
 
-- an `omni_xpu_kernel` wheel built for the active XPU target and Torch minor;
+```bash
+git clone https://github.com/Blackwood416/ComfyUI-OmniXPU ComfyUI/custom_nodes/ComfyUI-OmniXPU
+git -C ComfyUI/custom_nodes/ComfyUI-OmniXPU pull   # later updates
+```
+
+The node requires:
+
+- an `omni_xpu_kernel` wheel built for the active XPU target and Torch minor
+  (prebuilt Windows wheels are published at
+  <https://github.com/Blackwood416/omni-xpu-kernel/releases>; for A770 /
+  PyTorch 2.13 use `omni_xpu_kernel-0.2.0b1+torch213.dg2-cp313-cp313-win_amd64.whl`);
 - the pinned `comfy_kitchen` XPU integration;
 - upstream ComfyUI.
 
