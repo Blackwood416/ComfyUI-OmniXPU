@@ -37,6 +37,13 @@ COMPONENTS = (
         "adapters/rotary.py",
     ),
     Component(
+        "a770_rms_rope_bridge",
+        "rms_rope",
+        "adapter",
+        "A770 compatibility",
+        "adapters/rms_rope.py",
+    ),
+    Component(
         "norm_adapter",
         "norm",
         "adapter",

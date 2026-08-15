@@ -12,6 +12,7 @@ class Config:
         master = os.environ.get("OMNIXPU_ENABLE", "1") != "0"
         self.attention = master and os.environ.get("OMNIXPU_ATTENTION", "1") != "0"
         self.rotary = master and os.environ.get("OMNIXPU_ROTARY", "1") != "0"
+        self.rms_rope = master and os.environ.get("OMNIXPU_RMS_ROPE", "1") != "0"
         self.norm = master and os.environ.get("OMNIXPU_NORM", "1") != "0"
         self.fp8_gemm = master and os.environ.get("OMNIXPU_FP8_GEMM", "1") != "0"
         self.int8_ffn = master and os.environ.get("OMNIXPU_INT8_FFN", "1") != "0"

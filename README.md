@@ -62,6 +62,7 @@ for unsupported inputs:
 OMNIXPU_ENABLE=0            # Disable every custom-node component
 OMNIXPU_ATTENTION=0         # Disable the attention adapter
 OMNIXPU_NORM=0              # Disable the norm adapter
+OMNIXPU_RMS_ROPE=0          # Disable the A770 RMS-RoPE bridge
 OMNIXPU_FP8_GEMM=0          # Disable the temporary FP8 model/factory adapter
 OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
 OMNIXPU_KITCHEN_COMPAT=0    # Disable the A770 missing-backend bridge
