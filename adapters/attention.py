@@ -1109,11 +1109,10 @@ def apply():
                 f"cute_unsupported=dim{dim_head},q{q_len},kv{kv_len}"
             )
 
-        # A770 measured: the ESIMD D64 kernel is ~9-14x slower than torch
-        # SDPA for the MiniMax H3 VideoVAE fp16 contract (10.6ms vs 1.2ms at
-        # seq=1797; 1.45s vs 0.10s at seq=20683). The DG2 D64 sidecar path
-        # was inherited from the Xe2 tuning without an A770 re-measure; keep
-        # fp16/D64 on torch SDPA until a DG2-native D64 kernel exists.
+        # A770 measured: the v1 FMA D64 kernel is ~9-14x slower than torch
+        # SDPA, and the DG2-native v4.1 D64 DPAS port (2026-08-16) is correct
+        # and stable but still 0.84-0.92x torch SDPA at L>=4096 (0.57x at
+        # L=1797). Keep fp16/D64 on torch SDPA for the MiniMax H3 VideoVAE.
         if not reasons and (
             _backend_name == "esimd"
             and target == "dg2"
