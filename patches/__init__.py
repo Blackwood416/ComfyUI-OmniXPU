@@ -65,6 +65,20 @@ COMPONENTS = (
         "adapters/int8_ffn.py",
     ),
     Component(
+        "dynamic_vram_boundary_trim",
+        "dynamic_vram_boundary_trim",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/dynamic_vram.py",
+    ),
+    Component(
+        "lora_memory_adapter",
+        "lora_memory",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/lora_memory.py",
+    ),
+    Component(
         "a770_kitchen_compat",
         "kitchen_compat",
         "adapter",

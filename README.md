@@ -22,6 +22,7 @@ bundled with the `llm-scaler-omni` ComfyUI image.
 |---|---|
 | Kitchen XPU backend | INT8/QTensor operations, FP8 QDQ and stochastic rounding, SVDQuant, AdaLN, four RoPE APIs, and ConvRot |
 | ComfyUI adapter | Attention routing, LayerNorm/RMSNorm class integration, the remaining FP8 model/factory bridge, and fused Lumina/Z-Image INT8 FFN wiring |
+| Memory adapter | Cached whole-LoRA model budgets plus optional DynamicVRAM per-layer XPU staging measurements |
 | Legacy fix | Global `F.interpolate` and `torch.median`/`torch.nanmedian` workarounds; disabled by default |
 
 RoPE, generic INT8 linear dispatch, and the old FP8 negative-zero wrapper are
@@ -65,10 +66,17 @@ OMNIXPU_NORM=0              # Disable the norm adapter
 OMNIXPU_RMS_ROPE=0          # Disable the A770 RMS-RoPE bridge
 OMNIXPU_FP8_GEMM=0          # Disable the temporary FP8 model/factory adapter
 OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
+OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM=0  # Disable Windows XPU model-boundary trim
+OMNIXPU_LORA_MEMORY=0       # Disable cached whole-LoRA budgets and staging logs
 OMNIXPU_KITCHEN_COMPAT=0    # Disable the A770 missing-backend bridge
 OMNIXPU_INT8_DIRECT_CAST=1  # A770 opt-in: keep offloaded TensorWise INT8 on the quantized path
 OMNIXPU_INT8_PATCH_CACHE=1  # A770 opt-in: cache patched bf16 weights across sampling steps
 ```
+
+On Windows XPU, the boundary trim turns an unmet DynamicVRAM minimum-memory
+budget into an explicit partial VBAR reclaim before model loading. It preserves
+loaded models and is enabled by default; the environment variable above is the
+A/B-test escape hatch.
 
 Validated sub-routes can be disabled independently:
 
@@ -166,6 +174,18 @@ Dispatch decisions and fallback reasons:
 
 ```bash
 OMNIXPU_DEBUG_VERBOSE=1 python main.py
+```
+
+LoRA weights are measured once when the LoRA node executes. Unique tensor sizes
+are cached in a `ModelPatcher` attachment, inherited by clones, accumulated for
+stacked LoRAs, and added to both `memory_required` and an explicitly supplied
+`minimum_memory_required`. The base model's `model_size()` semantics stay
+unchanged. Model loads read the cached attachment instead of rescanning patches.
+DynamicVRAM layer scanning is disabled by default. To diagnose every LoRA
+staging operation, including its XPU state and any failure, enable:
+
+```bash
+OMNIXPU_LORA_MEMORY_TRACE=1 python main.py
 ```
 
 Set tracing variables before startup. The **OmniXPU Status** node reports:
