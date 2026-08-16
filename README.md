@@ -45,7 +45,8 @@ The node requires:
 - an `omni_xpu_kernel` wheel built for the active XPU target and Torch minor
   (prebuilt Windows wheels are published at
   <https://github.com/Blackwood416/omni-xpu-kernel/releases>; for A770 /
-  PyTorch 2.13 use `omni_xpu_kernel-0.2.0b1+torch213.dg2-cp313-cp313-win_amd64.whl`);
+  PyTorch 2.13 use the newest `0.2.0b1` wheel, currently build 1:
+  `omni_xpu_kernel-0.2.0b1+torch213.dg2.1-cp313-cp313-win_amd64.whl`);
 - the pinned `comfy_kitchen` XPU integration;
 - upstream ComfyUI.
 
