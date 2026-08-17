@@ -106,6 +106,13 @@ COMPONENTS = (
         "upstream_pending",
         "fixes/legacy_median.py",
     ),
+    Component(
+        "sdp_cache_lifecycle",
+        "sdp_cache_lifecycle",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/sdp_cache_lifecycle.py",
+    ),
 )
 
 
