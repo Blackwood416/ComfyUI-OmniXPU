@@ -834,7 +834,7 @@ def apply():
             _backend_name == "esimd"
             and target == "dg2"
             and q.dtype == torch.bfloat16
-            and q_len <= 1024
+            and (q_len <= 1024 if heads != 56 else q_len < 1024)
         ):
             reasons.append(f"dg2_esimd_small_bf16_q{q_len}")
 
@@ -1127,11 +1127,12 @@ def apply():
         # A770 measured: the v1 FMA D64 kernel is ~9-14x slower than torch
         # SDPA, and the DG2-native v4.1 D64 DPAS port (2026-08-16) is correct
         # and stable but still 0.84-0.92x torch SDPA at L>=4096 (0.57x at
-        # L=1797), ~3-10x slower for bf16. Keep D64 (fp16 AND bf16) on torch
-        # SDPA for the MiniMax H3 VideoVAE.
+        # L=1797). Keep fp16/D64 on torch SDPA (upstream behavior); the bf16
+        # extension is intentionally NOT applied to H3 (upstream-compatible).
         if not reasons and (
             _backend_name == "esimd"
             and target == "dg2"
+            and q.dtype == torch.float16
             and dim_head == 64
             and mask is None
         ):
@@ -1213,6 +1214,7 @@ def apply():
             and target == "dg2"
             and skip_reshape
             and dim_head == 128
+            and heads != 56  # H3 主模型（heads=56）保持上游路径
             and hasattr(selected_sdp, "sdp_bhld")
             and _is_contiguous_bhld(q, b, heads, q_len, dim_head)
             and _is_contiguous_bhld(k, b, heads, kv_len, dim_head)
@@ -1220,6 +1222,12 @@ def apply():
         )
         if use_bhld_direct:
             out = selected_sdp.sdp_bhld(q, k, v)
+            if os.environ.get("OMNIXPU_ATTN_NAN_TRACE", "0") != "0" and not torch.isfinite(out).all():
+                log.warning("[OmniXPU] NaN in sdp_bhld out: shape=%s dtype=%s heads=%d q_len=%d kv_len=%d",
+                            tuple(out.shape), q.dtype, heads, q_len, kv_len)
+            if os.environ.get("OMNIXPU_ATTN_NAN_TRACE", "0") != "0" and torch.isfinite(out).all() and torch.count_nonzero(out) == 0:
+                log.warning("[OmniXPU] ALL-ZERO sdp_bhld out: shape=%s heads=%d q_len=%d kv_len=%d",
+                            tuple(out.shape), heads, q_len, kv_len)
             log_debug_event(
                 "kernel",
                 "attention",
@@ -1243,6 +1251,12 @@ def apply():
                 details={"backend": selected_backend},
             )
             out = selected_sdp.sdp(q_blhd, k_blhd, v_blhd)
+            if os.environ.get("OMNIXPU_ATTN_NAN_TRACE", "0") != "0" and not torch.isfinite(out).all():
+                log.warning("[OmniXPU] NaN in sdp out: shape=%s dtype=%s heads=%d q_len=%d kv_len=%d",
+                            tuple(out.shape), q.dtype, heads, q_len, kv_len)
+            if os.environ.get("OMNIXPU_ATTN_NAN_TRACE", "0") != "0" and torch.isfinite(out).all() and torch.count_nonzero(out) == 0:
+                log.warning("[OmniXPU] ALL-ZERO sdp out: shape=%s heads=%d q_len=%d kv_len=%d",
+                            tuple(out.shape), heads, q_len, kv_len)
 
         # ESIMD accumulates in FP16; the per-call full output scan is pure
         # overhead for healthy runs (measured Krea2 slowdown). Off by default;
