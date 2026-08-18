@@ -1217,6 +1217,8 @@ def apply():
             and skip_reshape
             and dim_head == 128
             and q_len == kv_len  # sdp_bhld 契约要求 self-attention
+            and q_len % 16 == 0  # 旧 kernel 的 padding/stride bug 保护；
+            # 修复版 kernel 装齐后可放宽（回退路径始终正确）
             and heads != 56  # H3 主模型（heads=56）保持上游路径
             and hasattr(selected_sdp, "sdp_bhld")
             and _is_contiguous_bhld(q, b, heads, q_len, dim_head)
