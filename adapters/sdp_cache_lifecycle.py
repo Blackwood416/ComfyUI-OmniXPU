@@ -11,16 +11,20 @@ This adapter hooks ComfyUI's model-memory lifecycle so the sidecar cache is
 released when the model is truly unloaded:
 
   - ``model_management.unload_all_models`` (explicit unload / checkpoint swap)
-    -> clears the sidecar cache.
+    -> clears the sidecar cache by default.
 
 ``soft_empty_cache`` is deliberately NOT hooked by default: ComfyUI calls it
 on every model load / GC, which used to clear the packed Q/K/V cache before
 each new sampling run and cost a 2s+ repack on the first attention step.
 Keep the cache across runs while the model stays resident.
 
-Set ``OMNIXPU_SDP_CACHE_AUTOCLEAR=aggressive`` to restore the old behavior
-(clear on soft_empty_cache too); ``=0`` disables all hooks. The manual
-``OmniXPU Clear SDP Cache`` node remains available for on-demand control.
+Env ``OMNIXPU_SDP_CACHE_AUTOCLEAR``:
+  - ``1`` (default): clear on ``unload_all_models``; keep across soft clears.
+  - ``keep`` (or ``0``/``false``/``off``): keep the sidecar cache even across
+    model unloads (retains ~0.2-0.9 GB invisible USM; opt-in).
+  - ``aggressive`` (or ``soft``/``old``): clear on ``soft_empty_cache`` too.
+The manual ``OmniXPU Clear SDP Cache`` node remains available for on-demand
+control.
 """
 
 import logging
@@ -31,9 +35,10 @@ log = logging.getLogger("ComfyUI-OmniXPU")
 
 def apply():
     enabled = os.environ.get("OMNIXPU_SDP_CACHE_AUTOCLEAR", "1").strip().lower()
-    if enabled in ("0", "false", "no", "off"):
-        return False, "OMNIXPU_SDP_CACHE_AUTOCLEAR=0 (hooks disabled)"
     aggressive = enabled in ("aggressive", "soft", "old")
+    keep = enabled in ("keep", "0", "false", "no", "off")
+    if keep:
+        return False, "OMNIXPU_SDP_CACHE_AUTOCLEAR=keep (hooks disabled, cache retained)"
 
     try:
         import comfy.model_management as mm
@@ -79,17 +84,16 @@ def apply():
             _unload_count[0], aggressive,
         )
         orig_unload()
-        # Keep the packed Q/K/V sidecar across Queue runs by default (repack
-        # on the next first attention costs 2s+); the kernel's V4_CACHE_MAX
-        # bounds the cache. Only the aggressive opt-in clears on unload.
-        if aggressive:
+        # 默认在真实卸载时清理（不驻留不可见 USM）；OMNIXPU_SDP_CACHE_AUTOCLEAR
+        # =keep 才跨卸载保留（下一次 Queue 首步省一次 2s+ repack，opt-in）。
+        if not keep:
             _clear_sidecar()
 
     mm.soft_empty_cache = soft_empty_cache
     mm.unload_all_models = unload_all_models
     return (
         True,
-        "hooked model lifecycle -> sidecar cache kept across Queue runs "
-        "(soft_empty_cache and unload skipped; set "
-        "OMNIXPU_SDP_CACHE_AUTOCLEAR=aggressive to clear on both)",
+        "hooked model lifecycle -> sidecar cache kept across soft clears, "
+        "cleared on unload by default (OMNIXPU_SDP_CACHE_AUTOCLEAR=keep to "
+        "retain across unloads; =aggressive to clear on soft_empty_cache too)",
     )

@@ -40,7 +40,9 @@ class Config:
         )
         self.sdp_cache_lifecycle = (
             master
-            and os.environ.get("OMNIXPU_SDP_CACHE_AUTOCLEAR", "1") != "0"
+            and os.environ.get("OMNIXPU_SDP_CACHE_AUTOCLEAR", "1")
+            .strip().lower()
+            not in ("keep", "0", "false", "no", "off")
         )
 
 

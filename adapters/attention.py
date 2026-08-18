@@ -834,7 +834,7 @@ def apply():
             _backend_name == "esimd"
             and target == "dg2"
             and q.dtype == torch.bfloat16
-            and (q_len <= 1024 if heads != 56 else q_len < 1024)
+            and q_len < 1024
         ):
             reasons.append(f"dg2_esimd_small_bf16_q{q_len}")
 
@@ -1207,13 +1207,16 @@ def apply():
 
         # DG2 ESIMD BHLD-direct: for torch-contiguous [B, H, L, D] inputs the
         # sidecar reads BHLD natively and writes [B, L, H, D], skipping the
-        # three permute+copy layout conversions (measured ~6-10% e2e at
-        # seq>=1024 on A770). Only applies to D=128 fp16/bf16 ESIMD route.
+        # three permute+copy layout conversions. Only applies to D=128
+        # fp16/bf16 ESIMD self-attention route; kernel-level A/B shows it is
+        # neutral-to-slightly-slower on valid shapes, so the win (if any) is
+        # e2e bandwidth — kept as an additive capability, not assumed faster.
         use_bhld_direct = (
             selected_backend == "esimd"
             and target == "dg2"
             and skip_reshape
             and dim_head == 128
+            and q_len == kv_len  # sdp_bhld 契约要求 self-attention
             and heads != 56  # H3 主模型（heads=56）保持上游路径
             and hasattr(selected_sdp, "sdp_bhld")
             and _is_contiguous_bhld(q, b, heads, q_len, dim_head)
@@ -1221,7 +1224,16 @@ def apply():
             and _is_contiguous_bhld(v, b, heads, kv_len, dim_head)
         )
         if use_bhld_direct:
-            out = selected_sdp.sdp_bhld(q, k, v)
+            try:
+                out = selected_sdp.sdp_bhld(q, k, v)
+            except Exception:
+                # 任何异常（形状/契约/缺 kernel）都回退到原 permute 路径，
+                # 绝不把可工作的路径变成崩溃。
+                use_bhld_direct = False
+                q_blhd = q.permute(0, 2, 1, 3).contiguous()
+                k_blhd = k.permute(0, 2, 1, 3).contiguous()
+                v_blhd = v.permute(0, 2, 1, 3).contiguous()
+                out = selected_sdp.sdp(q_blhd, k_blhd, v_blhd)
             if os.environ.get("OMNIXPU_ATTN_NAN_TRACE", "0") != "0" and not torch.isfinite(out).all():
                 log.warning("[OmniXPU] NaN in sdp_bhld out: shape=%s dtype=%s heads=%d q_len=%d kv_len=%d",
                             tuple(out.shape), q.dtype, heads, q_len, kv_len)
@@ -1258,11 +1270,15 @@ def apply():
                 log.warning("[OmniXPU] ALL-ZERO sdp out: shape=%s heads=%d q_len=%d kv_len=%d",
                             tuple(out.shape), heads, q_len, kv_len)
 
-        # ESIMD accumulates in FP16; the per-call full output scan is pure
-        # overhead for healthy runs (measured Krea2 slowdown). Off by default;
-        # set OMNIXPU_ATTN_NAN_CHECK=1 (or the debug switch) to restore.
-        validate_output = _validate_attention_output() or (
-            os.environ.get("OMNIXPU_ATTN_NAN_CHECK", "0") != "0"
+        # ESIMD accumulates in FP16; the per-call full output scan is the
+        # overflow/NaN safety net. It is expensive on large outputs
+        # (measured ~9.5ms/call on Krea2 seq=4192 fp16, ~1s/step across the
+        # model's attention calls), so it can be disabled with
+        # OMNIXPU_ATTN_NAN_CHECK=0; default stays ON (upstream safety).
+        validate_output = (
+            (selected_backend == "esimd"
+             and os.environ.get("OMNIXPU_ATTN_NAN_CHECK", "1") != "0")
+            or _validate_attention_output()
         )
         if (
             q.dtype == torch.float16
