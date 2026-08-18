@@ -216,6 +216,21 @@ def _is_dense_bhld(tensor, batch, heads, seq, dim_head):
     return packed_bhld or blhd_backed
 
 
+def _is_contiguous_bhld(tensor, batch, heads, seq, dim_head):
+    """True when the tensor is a torch-contiguous [B, H, L, D] buffer."""
+    try:
+        shape = tuple(tensor.shape)
+        strides = tensor.stride()
+    except (AttributeError, TypeError):
+        return False
+    return shape == (batch, heads, seq, dim_head) and strides == (
+        heads * seq * dim_head,
+        seq * dim_head,
+        dim_head,
+        1,
+    )
+
+
 def _is_minimax_h3_h56_bhld(tensor, seq):
     try:
         shape = tuple(tensor.shape)
@@ -1112,7 +1127,8 @@ def apply():
         # A770 measured: the v1 FMA D64 kernel is ~9-14x slower than torch
         # SDPA, and the DG2-native v4.1 D64 DPAS port (2026-08-16) is correct
         # and stable but still 0.84-0.92x torch SDPA at L>=4096 (0.57x at
-        # L=1797). Keep fp16/D64 on torch SDPA for the MiniMax H3 VideoVAE.
+        # L=1797). Keep fp16/D64 on torch SDPA (upstream behavior); the bf16
+        # extension is intentionally NOT applied to H3 (upstream-compatible).
         if not reasons and (
             _backend_name == "esimd"
             and target == "dg2"
@@ -1122,7 +1138,7 @@ def apply():
         ):
             _torch_sdpa_count += 1
             route_call_count = _record_attention_route(
-                "dg2_torch_d64_fp16"
+                "dg2_torch_d64"
             )
             if route_call_count <= 3:
                 log.info(
@@ -1137,7 +1153,7 @@ def apply():
                 "kernel",
                 "attention",
                 {"q": q, "k": k, "v": v},
-                details={"backend": "torch", "route": "dg2_torch_d64_fp16"},
+                details={"backend": "torch", "route": "dg2_torch_d64"},
             )
             return _pytorch_fallback(
                 q,
@@ -1189,28 +1205,82 @@ def apply():
                 q.dtype,
             )
 
-        if skip_reshape:
-            q_blhd = q.permute(0, 2, 1, 3).contiguous()
-            k_blhd = k.permute(0, 2, 1, 3).contiguous()
-            v_blhd = v.permute(0, 2, 1, 3).contiguous()
-        else:
-            q_blhd = q.view(b, -1, heads, dim_head).contiguous()
-            k_blhd = k.view(b, -1, heads, dim_head).contiguous()
-            v_blhd = v.view(b, -1, heads, dim_head).contiguous()
-
-        log_debug_event(
-            "kernel",
-            "attention",
-            {"q": q_blhd, "k": k_blhd, "v": v_blhd},
-            details={"backend": selected_backend},
+        # DG2 ESIMD BHLD-direct: for torch-contiguous [B, H, L, D] inputs the
+        # sidecar reads BHLD natively and writes [B, L, H, D], skipping the
+        # three permute+copy layout conversions. Only applies to D=128
+        # fp16/bf16 ESIMD self-attention route; kernel-level A/B shows it is
+        # neutral-to-slightly-slower on valid shapes, so the win (if any) is
+        # e2e bandwidth — kept as an additive capability, not assumed faster.
+        use_bhld_direct = (
+            selected_backend == "esimd"
+            and target == "dg2"
+            and skip_reshape
+            and dim_head == 128
+            and q_len == kv_len  # sdp_bhld 契约要求 self-attention
+            and q_len % 16 == 0  # 旧 kernel 的 padding/stride bug 保护；
+            # 修复版 kernel 装齐后可放宽（回退路径始终正确）
+            and heads != 56  # H3 主模型（heads=56）保持上游路径
+            and hasattr(selected_sdp, "sdp_bhld")
+            and _is_contiguous_bhld(q, b, heads, q_len, dim_head)
+            and _is_contiguous_bhld(k, b, heads, kv_len, dim_head)
+            and _is_contiguous_bhld(v, b, heads, kv_len, dim_head)
         )
-        out = selected_sdp.sdp(q_blhd, k_blhd, v_blhd)
+        if use_bhld_direct:
+            try:
+                out = selected_sdp.sdp_bhld(q, k, v)
+            except Exception:
+                # 任何异常（形状/契约/缺 kernel）都回退到原 permute 路径，
+                # 绝不把可工作的路径变成崩溃。
+                use_bhld_direct = False
+                q_blhd = q.permute(0, 2, 1, 3).contiguous()
+                k_blhd = k.permute(0, 2, 1, 3).contiguous()
+                v_blhd = v.permute(0, 2, 1, 3).contiguous()
+                out = selected_sdp.sdp(q_blhd, k_blhd, v_blhd)
+            if os.environ.get("OMNIXPU_ATTN_NAN_TRACE", "0") != "0" and not torch.isfinite(out).all():
+                log.warning("[OmniXPU] NaN in sdp_bhld out: shape=%s dtype=%s heads=%d q_len=%d kv_len=%d",
+                            tuple(out.shape), q.dtype, heads, q_len, kv_len)
+            if os.environ.get("OMNIXPU_ATTN_NAN_TRACE", "0") != "0" and torch.isfinite(out).all() and torch.count_nonzero(out) == 0:
+                log.warning("[OmniXPU] ALL-ZERO sdp_bhld out: shape=%s heads=%d q_len=%d kv_len=%d",
+                            tuple(out.shape), heads, q_len, kv_len)
+            log_debug_event(
+                "kernel",
+                "attention",
+                {"q": q, "k": k, "v": v},
+                details={"backend": selected_backend, "route": "dg2_esimd_bhld_direct"},
+            )
+        else:
+            if skip_reshape:
+                q_blhd = q.permute(0, 2, 1, 3).contiguous()
+                k_blhd = k.permute(0, 2, 1, 3).contiguous()
+                v_blhd = v.permute(0, 2, 1, 3).contiguous()
+            else:
+                q_blhd = q.view(b, -1, heads, dim_head).contiguous()
+                k_blhd = k.view(b, -1, heads, dim_head).contiguous()
+                v_blhd = v.view(b, -1, heads, dim_head).contiguous()
 
-        # ESIMD accumulates in FP16, so keep its overflow safety check. CUTE
-        # accumulates in FP32 and its validated routes avoid this per-call full
-        # output scan by default; enable the diagnostic switch to restore it.
+            log_debug_event(
+                "kernel",
+                "attention",
+                {"q": q_blhd, "k": k_blhd, "v": v_blhd},
+                details={"backend": selected_backend},
+            )
+            out = selected_sdp.sdp(q_blhd, k_blhd, v_blhd)
+            if os.environ.get("OMNIXPU_ATTN_NAN_TRACE", "0") != "0" and not torch.isfinite(out).all():
+                log.warning("[OmniXPU] NaN in sdp out: shape=%s dtype=%s heads=%d q_len=%d kv_len=%d",
+                            tuple(out.shape), q.dtype, heads, q_len, kv_len)
+            if os.environ.get("OMNIXPU_ATTN_NAN_TRACE", "0") != "0" and torch.isfinite(out).all() and torch.count_nonzero(out) == 0:
+                log.warning("[OmniXPU] ALL-ZERO sdp out: shape=%s heads=%d q_len=%d kv_len=%d",
+                            tuple(out.shape), heads, q_len, kv_len)
+
+        # ESIMD accumulates in FP16; the per-call full output scan is the
+        # overflow/NaN safety net. It is expensive on large outputs
+        # (measured ~9.5ms/call on Krea2 seq=4192 fp16, ~1s/step across the
+        # model's attention calls), so it can be disabled with
+        # OMNIXPU_ATTN_NAN_CHECK=0; default stays ON (upstream safety).
         validate_output = (
-            selected_backend == "esimd" or _validate_attention_output()
+            (selected_backend == "esimd"
+             and os.environ.get("OMNIXPU_ATTN_NAN_CHECK", "1") != "0")
+            or _validate_attention_output()
         )
         if (
             q.dtype == torch.float16

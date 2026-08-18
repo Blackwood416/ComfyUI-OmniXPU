@@ -38,6 +38,12 @@ class Config:
         self.median_fix = (
             master and os.environ.get("OMNIXPU_MEDIAN_FIX", "0") != "0"
         )
+        self.sdp_cache_lifecycle = (
+            master
+            and os.environ.get("OMNIXPU_SDP_CACHE_AUTOCLEAR", "1")
+            .strip().lower()
+            not in ("keep", "0", "false", "no", "off")
+        )
 
 
 config = Config()
