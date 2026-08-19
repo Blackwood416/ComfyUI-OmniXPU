@@ -5,6 +5,12 @@ from __future__ import annotations
 import functools
 import logging
 import sys
+from contextlib import nullcontext
+
+try:
+    from comfy_aimdo import model_vbar as _aimdo_model_vbar
+except ImportError:
+    _aimdo_model_vbar = None
 
 
 log = logging.getLogger("ComfyUI-OmniXPU")
@@ -35,25 +41,57 @@ def _expanded_models(models):
     return expanded
 
 
-def _minimum_memory_target(model_management, args, kwargs):
-    memory_required = _load_argument(args, kwargs, "memory_required", 0, 0)
+def _minimum_memory_required_argument(args, kwargs):
     # ComfyUI moved force_patch_weights ahead of minimum_memory_required in
     # newer signatures (0.33: models, memory_required, force_patch_weights,
     # minimum_memory_required), while 0.31 had minimum_memory_required at
     # position 2. Accept either, ignoring a bool (force_patch_weights) value.
-    minimum_required = None
     for position in (3, 2):
         candidate = _load_argument(
             args, kwargs, "minimum_memory_required", position, None
         )
         if candidate is not None and not isinstance(candidate, bool):
-            minimum_required = candidate
-            break
+            return candidate
+    return None
+
+
+def _minimum_memory_target(model_management, args, kwargs):
+    memory_required = _load_argument(args, kwargs, "memory_required", 0, 0)
+    minimum_required = _minimum_memory_required_argument(args, kwargs)
     reserved = model_management.extra_reserved_memory()
     inference = model_management.minimum_inference_memory()
     if minimum_required is None:
         return max(inference, memory_required + reserved)
     return max(inference, minimum_required + reserved)
+
+
+def _inference_memory_budget(args, kwargs):
+    memory_required = _load_argument(args, kwargs, "memory_required", 0, 0)
+    minimum_required = _minimum_memory_required_argument(args, kwargs)
+    if minimum_required is None:
+        return max(0, int(memory_required))
+    return max(0, int(minimum_required))
+
+
+def _aimdo_budget_scope(models, budget):
+    if _aimdo_model_vbar is None:
+        return nullcontext(), ()
+    budget_scope = getattr(_aimdo_model_vbar, "inference_memory_budget", None)
+    if budget_scope is None:
+        return nullcontext(), ()
+
+    devices = sorted(
+        {
+            model.load_device.index
+            for model in models
+            if model.is_dynamic()
+            and getattr(model.load_device, "type", None) == "xpu"
+            and model.load_device.index is not None
+        }
+    )
+    if not devices or budget <= 0:
+        return nullcontext(), ()
+    return budget_scope(budget, devices), tuple(devices)
 
 
 def _trim_pass(model_management, device, target, requested, include_requested):
@@ -123,8 +161,20 @@ def _patch_model_loader(model_management):
     def boundary_trimmed(models, *args, **kwargs):
         expanded = _expanded_models(models)
         target = _minimum_memory_target(model_management, args, kwargs)
+        inference_budget = _inference_memory_budget(args, kwargs)
         _trim_dynamic_boundary(model_management, expanded, target)
-        return original(models, *args, **kwargs)
+        budget_scope, budget_devices = _aimdo_budget_scope(
+            expanded, inference_budget
+        )
+        if budget_devices:
+            log.info(
+                "[OmniXPU] AIMDO inference budget: devices=%s "
+                "minimum=%.1fMiB",
+                ",".join(map(str, budget_devices)),
+                inference_budget / (1024 ** 2),
+            )
+        with budget_scope:
+            return original(models, *args, **kwargs)
 
     setattr(boundary_trimmed, _PATCH_MARKER, original)
     model_management.load_models_gpu = boundary_trimmed
