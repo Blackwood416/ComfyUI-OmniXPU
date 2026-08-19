@@ -88,6 +88,15 @@ def _rewrite_tiled_vae(tiled_vae, threshold_bytes):
 
 
 def apply():
+    import os
+
+    if os.environ.get("UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS") == "1":
+        return (
+            False,
+            "UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1 lifts the ~4GiB "
+            "single-allocation limit; CPU staging is not needed",
+        )
+
     try:
         from comfy.ldm.seedvr import vae as seedvr_vae
     except ModuleNotFoundError as exc:
@@ -100,8 +109,6 @@ def apply():
         return False, "ComfyUI SeedVR2 tiled_vae is not available"
     if getattr(tiled_vae, _PATCH_MARKER, False):
         return False, "SeedVR2 VAE decode fix is already applied"
-
-    import os
 
     raw = os.environ.get("OMNIXPU_SEEDVR_VAE_CPU_STAGE_BYTES", "")
     try:
