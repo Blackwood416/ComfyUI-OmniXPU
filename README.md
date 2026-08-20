@@ -225,6 +225,29 @@ Kitchen backend ownership can be inspected independently:
 python -c 'import comfy_kitchen as ck; print(ck.list_backends()["xpu"])'
 ```
 
+## SeedVR2 on A770
+
+The SeedVR2 adapters (from upstream #622 plus A770 validation) route:
+
+- `seedvr_ada_reshape`: bounded Ada modulation, removing a >4 GiB
+  `repeat_interleave` that OOMs K sampling on A770;
+- `seedvr_capacity` / `large_video_preprocess`: bounded attention, SwiGLU,
+  Lanczos and VAE staging;
+- `seedvr_cat_pad` / `norm` SeedVR GroupNorm: enabled on DG2 with the
+  validated kernel route (shapes match the BMG-validated set);
+- `seedvr_vae_decode`: CPU-stages the tiled decode result when a single XPU
+  allocation would exceed the ~4 GiB per-allocation limit; auto-disables
+  when `UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1`;
+- DG2 D128 attention: torch SDPA for `q_len` in `[1024, 2048)` and
+  `(2048, 4096)` (measured 1.1-1.6x slower with ESIMD on A770), ESIMD for
+  `q_len == 2048` and `q_len >= 4096`.
+
+Measured end-to-end on A770 (`seedvr2_3b_int8_upscale_video.json`):
+681 s -> 607 s. Negatives recorded in `WHL_BUILD_INSTALL.md`: spatial tile
+1024 OOMs, temporal chunk 125 gives no gain, and lowering
+`OMNIXPU_INT8_FAST_FORWARD_COPY_MIN_ELEMS` below 16 Mi does not speed up
+sampling.
+
 ## Contribution boundary
 
 New device-generic math, layouts, quantization, or fallback logic belongs in
