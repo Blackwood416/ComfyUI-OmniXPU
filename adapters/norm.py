@@ -54,6 +54,10 @@ def _target_supports_group_norm(target):
     return target == "bmg"
 
 
+def _target_supports_seedvr_group_norm(target):
+    return target in ("bmg", "dg2")
+
+
 def _can_use_bmg_group_norm(x, num_groups, weight, bias, eps):
     return (
         _allow_bmg_group_norm
@@ -247,7 +251,7 @@ def _run_seedvr_group_norm(x, num_groups, weight, bias, eps):
     global _logged_seedvr_group_norm
     if not _logged_seedvr_group_norm:
         log.info(
-            "[OmniXPU] SeedVR BMG GroupNorm: shape=%s stride=%s "
+            "[OmniXPU] SeedVR GroupNorm: shape=%s stride=%s "
             "dtype=%s groups=%d",
             tuple(x.shape),
             tuple(x.stride()),
@@ -296,7 +300,7 @@ def apply():
             _omni_norm, "supports_group_norm_seedvr_bmg", None
         )
         _allow_seedvr_group_norm = (
-            _target_supports_group_norm(target)
+            _target_supports_seedvr_group_norm(target)
             and callable(supports_seedvr_group_norm)
             and supports_seedvr_group_norm()
             and os.environ.get("OMNIXPU_SEEDVR_GROUPNORM", "1") != "0"
@@ -312,7 +316,7 @@ def apply():
             target or "unknown",
         )
         log.info(
-            "[OmniXPU] norm: SeedVR BMG GroupNorm route %s (target=%s)",
+            "[OmniXPU] norm: SeedVR GroupNorm route %s (target=%s)",
             "enabled" if _allow_seedvr_group_norm else "disabled",
             target or "unknown",
         )

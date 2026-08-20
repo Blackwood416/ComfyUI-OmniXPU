@@ -160,8 +160,9 @@ def apply():
         import omni_xpu_kernel
     except ImportError:
         return False, "omni_xpu_kernel not available"
-    if getattr(omni_xpu_kernel, "__xpu_target__", "") != "bmg":
-        return False, "SeedVR2 cat-pad route is BMG-only"
+    target = getattr(omni_xpu_kernel, "__xpu_target__", "")
+    if target not in ("bmg", "dg2"):
+        return False, "SeedVR2 cat-pad route requires BMG or DG2"
     supports = getattr(probe.layout, "supports_cat_pad_bmg", None)
     if not callable(supports) or not supports():
         return False, "omni_xpu_kernel BMG cat-pad capability unavailable"
