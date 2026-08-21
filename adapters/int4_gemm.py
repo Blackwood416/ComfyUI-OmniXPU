@@ -1,9 +1,12 @@
 """INT4 GEMM calling wrapper over omni_xpu_kernel svdq ops.
 
-Exposes ``onednn_int4_gemm_preconverted`` with an optional per-block
-zero-point parameter (torchao asymmetric INT4 format). The caller passes
-``zp_u8`` only when the kernel supports it; otherwise the op falls back to
-the scalar zp=8 path.
+两条路线各自走各自的，互不互通：
+- wa4（对称，无 zp）：``onednn_int4_gemm_preconverted(act, packed_u4, scales_f16)``
+- tint4/torchao（非对称，per-block zp）：
+  ``onednn_int4_gemm_torchao(act, packed_u4, zp_u8, scales_f16)``
+  （raw qdata 字节视图未 XOR，w = (q - zp) * scale 在 oneDNN 内完成）
+
+对应算子缺失时不处理（返回 None），模型走自身原有 python/torchao 路径。
 """
 
 import logging
@@ -24,28 +27,39 @@ def _get_svdq():
 
 
 def int4_gemm(act, packed_u4, scales_f16, zp_u8=None):
-    """Fused INT4 dequant + GEMM via oneDNN u4 matmul.
+    """INT4 GEMM：无 zp 走 wa4/preconverted，有 zp 走 tint4/torchao。
 
     Args:
         act: [M, K] bf16/f16/f32 activations.
-        packed_u4: [N, K/2] uint8 — unsigned u4 weights (packed ^ 0x88).
-        scales_f16: [G, N] f16 — weight scales.
-        zp_u8: [G, N] uint8, optional — per-block zero points (torchao
-            asymmetric INT4, w = (q - zp) * scale inside oneDNN).
+        packed_u4: [N, K/2] uint8 — wa4 为 ^0x88 的 preconverted 约定；
+            tint4 为 raw qdata 字节视图（未 XOR）。
+        scales_f16: [G, N] f16 — per-group weight scales.
+        zp_u8: [G, N] uint8, optional — tint4 per-block zero points。
 
     Returns:
-        [M, N] same dtype as act.
+        [M, N] same dtype as act；对应算子缺失时返回 None（不处理）。
     """
-    return _get_svdq().onednn_int4_gemm_preconverted(act, packed_u4, scales_f16, zp_u8)
+    svdq = _get_svdq()
+    if zp_u8 is not None:
+        if not hasattr(svdq, "onednn_int4_gemm_torchao"):
+            return None
+        return svdq.onednn_int4_gemm_torchao(act, packed_u4, zp_u8, scales_f16)
+    if not hasattr(svdq, "onednn_int4_gemm_preconverted"):
+        return None
+    return svdq.onednn_int4_gemm_preconverted(act, packed_u4, scales_f16)
 
 
 def apply():
-    """Verify the kernel exposes the INT4 GEMM op used by the wrapper."""
+    """报告两条 kernel 路线的可用性；都没有则组件不生效。"""
     try:
         svdq = _get_svdq()
-        if not hasattr(svdq, "onednn_int4_gemm_preconverted"):
-            return False, "kernel missing onednn_int4_gemm_preconverted"
-        log.info("[OmniXPU] int4_gemm adapter: INT4 GEMM (zp) op available")
+        status = {
+            "preconverted": hasattr(svdq, "onednn_int4_gemm_preconverted"),
+            "torchao": hasattr(svdq, "onednn_int4_gemm_torchao"),
+        }
+        if not any(status.values()):
+            return False, "kernel missing both INT4 GEMM ops"
+        log.info("[OmniXPU] int4_gemm adapter: %s", status)
         return True, ""
     except Exception as exc:
         return False, str(exc)
