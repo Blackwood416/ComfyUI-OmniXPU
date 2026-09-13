@@ -343,7 +343,6 @@ def apply():
             # fell back to eager. Keeping the bodies opaque to Dynamo
             # leaves the outer Linear.forward (and ComfyUI's
             # transformer_options handling) traced.
-            @torch.compiler.disable(reason="ComfyUI-OmniXPU fp8 fast path")
             def _try_fp8_fast_path(self, input):
                 # FP8 weight fast path: the module already holds fp8 storage,
                 # so skip the QuantizedTensor round trip. Skipped whenever
@@ -439,7 +438,6 @@ def apply():
                             _log_first(f"forward failed, falling back: {e}")
                 return None
 
-            @torch.compiler.disable(reason="ComfyUI-OmniXPU int8 fast path")
             def _try_int8_fast_path(self, input):
                 # INT8 fast path (A770/DG2): call the omni oneDNN s8 GEMM
                 # directly instead of going through
@@ -591,6 +589,16 @@ def apply():
                     details=_dispatch_details(self),
                     verbose_only=True,
                 )
+                # torch.compile: skip the eager fast paths. They specialise on
+                # every weight shape (one graph per layer until Dynamo hits its
+                # per-code recompile limit), and keeping them out of the graph
+                # with a decorator inserts a graph break inside the model's
+                # block loop, which trips Dynamo's transformer_options resume
+                # path. ComfyUI's own quantized dispatch reaches the same XPU
+                # kernels through the registered custom ops, so defer to it
+                # while tracing; eager keeps using the fast paths unchanged.
+                if torch.compiler.is_compiling():
+                    return _orig_fwd(self, input, *fwd_args, **fwd_kwargs)
                 output = _try_fp8_fast_path(self, input)
                 if output is not None:
                     return output
