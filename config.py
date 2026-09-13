@@ -53,6 +53,9 @@ class Config:
         self.kitchen_compat = (
             master and os.environ.get("OMNIXPU_KITCHEN_COMPAT", "1") != "0"
         )
+        self.int8_native_gate = (
+            master and os.environ.get("OMNIXPU_INT8_NATIVE", "1") != "0"
+        )
         self.interpolate_fix = (
             master and os.environ.get("OMNIXPU_INTERPOLATE_FIX", "0") != "0"
         )
