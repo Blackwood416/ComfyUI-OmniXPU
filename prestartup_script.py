@@ -94,3 +94,41 @@ def apply_xpu_memory_fraction() -> float | None:
 
 
 apply_xpu_memory_fraction()
+
+
+def apply_runtime_providers():
+    """Load the local bootstrap without importing the custom-node package.
+
+    Must run after ComfyUI's import of ``comfy_aimdo.control`` (the official
+    attempt) and before ``control.init_devices()``.
+    """
+    import importlib.util
+    from pathlib import Path
+
+    runtime_path = Path(__file__).with_name("runtime_bootstrap.py")
+    if not runtime_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(
+        "_comfyui_omnixpu_runtime_bootstrap", runtime_path
+    )
+    module = importlib.util.module_from_spec(spec)
+    # Register before execution: dataclasses resolves field types through
+    # sys.modules[cls.__module__], and an unregistered synthetic module makes
+    # @dataclass raise AttributeError('NoneType' object has no attribute ...).
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.bootstrap()
+
+
+try:
+    _provider_state = apply_runtime_providers()
+    if _provider_state is not None:
+        _LOG.info("[OmniXPU] runtime providers: %s", _provider_state)
+except Exception as _provider_exc:  # noqa: BLE001 - startup policy decides
+    _mode = os.environ.get(_MASTER_ENV_NAME, "auto").strip().lower()
+    if _mode == "required":
+        raise
+    import traceback as _traceback
+
+    _traceback.print_exc()
+    _LOG.warning("[OmniXPU] runtime provider activation skipped: %s", _provider_exc)
