@@ -14,6 +14,14 @@ class Config:
         self.rotary = master and os.environ.get("OMNIXPU_ROTARY", "1") != "0"
         self.rms_rope = master and os.environ.get("OMNIXPU_RMS_ROPE", "1") != "0"
         self.norm = master and os.environ.get("OMNIXPU_NORM", "1") != "0"
+        self.h3_rms_modulation = (
+            master
+            # Opt-in: the fused H3 norm+modulation kernel measured only ~0.5%
+            # end-to-end on A770 (135.6 s vs 136.3 s over a 6-step ref2va run)
+            # while running a different numeric path than the eager chain, so
+            # the stock path stays the default.
+            and os.environ.get("OMNIXPU_H3_RMS_MODULATION", "0") != "0"
+        )
         self.fp8_gemm = master and os.environ.get("OMNIXPU_FP8_GEMM", "1") != "0"
         self.int8_ffn = master and os.environ.get("OMNIXPU_INT8_FFN", "1") != "0"
         self.int4_gemm = master and os.environ.get("OMNIXPU_INT4_GEMM", "1") != "0"

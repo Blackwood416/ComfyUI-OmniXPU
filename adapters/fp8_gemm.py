@@ -168,6 +168,40 @@ def _prepare_scale(scale, weight, input):
     return scale
 
 
+def _has_dynamic_weight_lifecycle(module):
+    # ComfyUI owns the weight through cast_bias_weight / lowvram functions in
+    # these cases; the fused path must not hold its own reference.
+    return (
+        bool(getattr(module, "comfy_cast_weights", False))
+        or hasattr(module, "_v")
+        or getattr(module, "weight_lowvram_function", None) is not None
+        or getattr(module, "bias_lowvram_function", None) is not None
+    )
+
+
+def _fp8_storage(weight, quantized_tensor_type):
+    """Return (fp8 tensor, layout scale) for either storage form."""
+    if quantized_tensor_type is not None and isinstance(
+        weight, quantized_tensor_type
+    ):
+        qdata = getattr(weight, "_qdata", None)
+        if getattr(qdata, "dtype", None) in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ):
+            params = getattr(weight, "params", None)
+            if params is None:
+                params = getattr(weight, "_params", None)
+            return qdata, getattr(params, "scale", None)
+        return None, None
+    if getattr(weight, "dtype", None) in (
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ):
+        return weight, None
+    return None, None
+
+
 def apply():
     global _omni_fp8_linear, _omni_int8
     import sys
@@ -261,25 +295,38 @@ def apply():
             # -- Intercept 1: _forward(input, weight, bias) --
             # Called from forward_comfy_cast_weights after cast_bias_weight.
             def _mp_inner_forward(self, input, weight, bias):
-                if (_omni_fp8_linear is not None and input.is_xpu and input.ndim == 2 and
-                        hasattr(weight, 'dtype') and weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)):
-                    _log_first(f"input={list(input.shape)} weight={list(weight.shape)} dtype={weight.dtype}")
+                fp8_weight, layout_scale = _fp8_storage(weight, QuantizedTensor)
+                input_shape = input.shape
+                input_2d = (
+                    input.reshape(-1, input_shape[-1])
+                    if input.ndim >= 3
+                    else input
+                )
+                if (_omni_fp8_linear is not None and input.is_xpu
+                        and input_2d.ndim == 2 and fp8_weight is not None):
+                    _log_first(f"input={list(input_2d.shape)} weight={list(fp8_weight.shape)} dtype={fp8_weight.dtype}")
                     try:
                         scale_w = getattr(self, 'scale_weight', None)
-                        if scale_w is None:
+                        if layout_scale is not None:
+                            scale_w = layout_scale
+                        elif scale_w is None:
                             p = getattr(self.weight, 'params', None) or getattr(self.weight, '_layout_params', None)
                             scale_w = getattr(p, 'scale', None) if p else None
                         if scale_w is None:
                             scale_w = torch.ones((), device=input.device, dtype=torch.float32)
-                        scale_w = _prepare_scale(scale_w, weight, input)
-                        output = _omni_fp8_linear(input, weight, scale_w, bias)
+                        scale_w = _prepare_scale(scale_w, fp8_weight, input_2d)
+                        output = _omni_fp8_linear(input_2d, fp8_weight, scale_w, bias)
                         if output is not None:
                             log_debug_event(
                                 "kernel",
                                 "fp8_linear",
-                                {"input": input, "weight": weight, "weight_scale": scale_w, "bias": bias},
-                                details={"backend": "omni_xpu", "format": weight.dtype},
+                                {"input": input_2d, "weight": fp8_weight, "weight_scale": scale_w, "bias": bias},
+                                details={"backend": "omni_xpu", "format": fp8_weight.dtype},
                             )
+                            if input.ndim >= 3:
+                                output = output.reshape(
+                                    *input_shape[:-1], fp8_weight.shape[0]
+                                )
                             return output
                     except Exception as e:
                         if is_fatal_accelerator_error(e):
@@ -289,14 +336,109 @@ def apply():
 
             # -- Intercept 2: forward() --
             # Intercepts before comfy_kitchen QuantizedTensor dispatch.
-            def _mp_forward(self, input, *fwd_args, **fwd_kwargs):
-                log_debug_event(
-                    "dispatch",
-                    "mixed_precision.Linear",
-                    {"input": input},
-                    details=_dispatch_details(self),
-                    verbose_only=True,
-                )
+            #
+            # The fast paths below only select a native/custom op and
+            # return, but tracing them made Dynamo build one graph per
+            # weight shape until it hit the per-code recompile limit and
+            # fell back to eager. Keeping the bodies opaque to Dynamo
+            # leaves the outer Linear.forward (and ComfyUI's
+            # transformer_options handling) traced.
+            def _try_fp8_fast_path(self, input):
+                # FP8 weight fast path: the module already holds fp8 storage,
+                # so skip the QuantizedTensor round trip. Skipped whenever
+                # ComfyUI manages the weight dynamically (lowvram/offload) so
+                # the fused call never fights cast_bias_weight.
+                if (
+                    _omni_fp8_linear is not None
+                    and input.is_xpu
+                    and getattr(self, "quant_format", None)
+                    in ("float8_e4m3fn", "float8_e5m2")
+                    and not _has_dynamic_weight_lifecycle(self)
+                    and len(self.weight_function) == 0
+                    and len(self.bias_function) == 0
+                ):
+                    input_shape = input.shape
+                    input_2d = (
+                        input.reshape(-1, input_shape[-1])
+                        if input.ndim == 3
+                        else input
+                    )
+                    if input_2d.ndim == 2:
+                        try:
+                            w = self.weight
+                            fp8_dtype = (
+                                torch.float8_e4m3fn
+                                if self.quant_format == "float8_e4m3fn"
+                                else torch.float8_e5m2
+                            )
+                            if (
+                                QuantizedTensor is not None
+                                and isinstance(w, QuantizedTensor)
+                            ):
+                                w_fp8 = w._qdata
+                                params = getattr(w, "params", None) or getattr(
+                                    w, "_params", None
+                                )
+                                scale_w = getattr(params, "scale", None)
+                            else:
+                                w_fp8 = (
+                                    w if w.dtype == fp8_dtype
+                                    else w.view(fp8_dtype)
+                                )
+                                scale_w = getattr(self, "scale_weight", None)
+                            if scale_w is None:
+                                scale_w = torch.ones(
+                                    (), device=input.device, dtype=torch.float32
+                                )
+                            scale_w = comfy.model_management.cast_to_device(
+                                scale_w, input.device, torch.float32
+                            )
+                            w_fp8 = comfy.model_management.cast_to_device(
+                                w_fp8, input.device, None
+                            )
+                            scale_w = _prepare_scale(scale_w, w_fp8, input_2d)
+                            bias = (
+                                comfy.model_management.cast_to_device(
+                                    self.bias, input.device, input.dtype
+                                )
+                                if self.bias is not None
+                                else None
+                            )
+                            _log_first(
+                                f"input={list(input_2d.shape)} "
+                                f"weight={list(w_fp8.shape)} "
+                                f"dtype={w_fp8.dtype} format={self.quant_format}"
+                            )
+                            o = _omni_fp8_linear(
+                                input_2d, w_fp8, scale_w, bias
+                            )
+                            if o is not None:
+                                log_debug_event(
+                                    "kernel",
+                                    "fp8_linear",
+                                    {
+                                        "input": input_2d,
+                                        "weight": w_fp8,
+                                        "weight_scale": scale_w,
+                                        "bias": bias,
+                                    },
+                                    details={
+                                        "backend": "omni_xpu",
+                                        "format": self.quant_format,
+                                    },
+                                )
+                                if input.ndim == 3:
+                                    o = o.reshape(
+                                        input_shape[0], input_shape[1], -1
+                                    )
+                                return o
+                        except Exception as e:
+                            if is_fatal_accelerator_error(e):
+                                raise
+                            _log_first(f"forward failed, falling back: {e}")
+                return None
+
+            def _try_int8_fast_path(self, input):
                 # INT8 fast path (A770/DG2): call the omni oneDNN s8 GEMM
                 # directly instead of going through
                 # QuantizedTensor.from_float -> cast_bias_weight -> torch
@@ -437,48 +579,32 @@ def apply():
                         )
                     )
 
-                if (_omni_fp8_linear is not None and input.is_xpu and
-                        getattr(self, 'quant_format', None) in ('float8_e4m3fn', 'float8_e5m2') and
-                        len(self.weight_function) == 0 and len(self.bias_function) == 0):
-                    input_shape = input.shape
-                    input_2d = input.reshape(-1, input_shape[-1]) if input.ndim == 3 else input
-                    if input_2d.ndim == 2:
-                        try:
-                            w = self.weight
-                            fp8_dtype = torch.float8_e4m3fn if self.quant_format == 'float8_e4m3fn' else torch.float8_e5m2
-                            if QuantizedTensor is not None and isinstance(w, QuantizedTensor):
-                                w_fp8 = w._qdata
-                                scale_w = getattr(w.params, 'scale', None)
-                            else:
-                                w_fp8 = w if w.dtype == fp8_dtype else w.view(fp8_dtype)
-                                scale_w = getattr(self, 'scale_weight', None)
-                            if scale_w is None:
-                                scale_w = torch.ones((), device=input.device, dtype=torch.float32)
-                            scale_w = comfy.model_management.cast_to_device(scale_w, input.device, torch.float32)
-                            w_fp8 = comfy.model_management.cast_to_device(w_fp8, input.device, None)
-                            scale_w = _prepare_scale(scale_w, w_fp8, input_2d)
-                            bias = (comfy.model_management.cast_to_device(self.bias, input.device, input.dtype)
-                                    if self.bias is not None else None)
+                return None
 
-                            _log_first(f"input={list(input_2d.shape)} weight={list(w_fp8.shape)} "
-                                       f"dtype={w_fp8.dtype} format={self.quant_format}")
-
-                            o = _omni_fp8_linear(input_2d, w_fp8, scale_w, bias)
-                            if o is not None:
-                                log_debug_event(
-                                    "kernel",
-                                    "fp8_linear",
-                                    {"input": input_2d, "weight": w_fp8, "weight_scale": scale_w, "bias": bias},
-                                    details={"backend": "omni_xpu", "format": self.quant_format},
-                                )
-                                if input.ndim == 3:
-                                    o = o.reshape(input_shape[0], input_shape[1], -1)
-                                return o
-                        except Exception as e:
-                            if is_fatal_accelerator_error(e):
-                                raise
-                            _log_first(f"forward failed, falling back: {e}")
-
+            def _mp_forward(self, input, *fwd_args, **fwd_kwargs):
+                log_debug_event(
+                    "dispatch",
+                    "mixed_precision.Linear",
+                    {"input": input},
+                    details=_dispatch_details(self),
+                    verbose_only=True,
+                )
+                # torch.compile: skip the eager fast paths. They specialise on
+                # every weight shape (one graph per layer until Dynamo hits its
+                # per-code recompile limit), and keeping them out of the graph
+                # with a decorator inserts a graph break inside the model's
+                # block loop, which trips Dynamo's transformer_options resume
+                # path. ComfyUI's own quantized dispatch reaches the same XPU
+                # kernels through the registered custom ops, so defer to it
+                # while tracing; eager keeps using the fast paths unchanged.
+                if torch.compiler.is_compiling():
+                    return _orig_fwd(self, input, *fwd_args, **fwd_kwargs)
+                output = _try_fp8_fast_path(self, input)
+                if output is not None:
+                    return output
+                output = _try_int8_fast_path(self, input)
+                if output is not None:
+                    return output
                 return _orig_fwd(self, input, *fwd_args, **fwd_kwargs)
 
             klass.Linear.forward = _mp_forward
