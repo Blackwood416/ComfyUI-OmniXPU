@@ -221,6 +221,22 @@ Measured on Arc A770, Krea2 turbo int8 convrot with the fp8 text encoder
 The compile cost is paid once per graph and shape; it pays off when a session
 runs many images at the same resolution, not for one-off generations.
 
+### Compiled models bypass AIMDO's dynamic VRAM
+
+ComfyUI's `TorchCompileModel` clones the patcher with `disable_dynamic=True`
+because a compiled graph captures weight addresses once; weights cannot be
+paged or re-cast per call afterwards. The compiled model is therefore loaded
+statically (`Model <name> prepared for dynamic VRAM loading` never appears for
+it in the log) while everything else in the process keeps using AIMDO's
+dynamic VRAM path.
+
+That is a trade-off, not a bug: compile only helps models that fit in VRAM as
+a resident copy. On a 16 GB A770, a 12.8 GB INT8 DiT can be compiled (the text
+encoder stays dynamic), while a 32 GB H3 checkpoint cannot and must keep using
+AIMDO's dynamic VM. Upstream's runtime bootstrap states the same limitation in
+one line: `AIMDO memory compiler is not yet supported on XPU; DynamicVRAM
+model-weight offloading is available. This does not disable torch.compile.`
+
 ## Debugging and diagnostics
 
 Kernel-only tracing:
