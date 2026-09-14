@@ -68,6 +68,10 @@ class Config:
             .strip().lower()
             not in ("keep", "0", "false", "no", "off")
         )
+        self.sampling_prefetch = (
+            master
+            and os.environ.get("OMNIXPU_H3_SAMPLING_PREFETCH", "1") != "0"
+        )
 
 
 config = Config()

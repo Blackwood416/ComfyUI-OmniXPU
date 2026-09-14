@@ -162,6 +162,13 @@ COMPONENTS = (
         "ComfyUI-OmniXPU",
         "adapters/sdp_cache_lifecycle.py",
     ),
+    Component(
+        "h3_sampling_prefetch",
+        "sampling_prefetch",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/sampling_prefetch.py",
+    ),
 )
 
 

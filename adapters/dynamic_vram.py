@@ -16,6 +16,35 @@ except ImportError:
 log = logging.getLogger("ComfyUI-OmniXPU")
 
 _PATCH_MARKER = "__omnixpu_dynamic_vram_boundary_original__"
+_FREE_MEMORY_MARKER = "__omnixpu_xpu_free_memory_original__"
+
+
+def _patch_free_memory(model_management, torch_module):
+    """Include foreign VBAR/sidecar allocations in Comfy's XPU budget.
+
+    The native Torch allocator does not own VBAR pages. Subtracting only
+    Torch active bytes from device capacity can therefore report an almost
+    empty card while AIMDO has mapped most of it. Match Comfy's CUDA budget:
+    global physical free memory plus reusable Torch allocator cache.
+    """
+    original = model_management.get_free_memory
+    if hasattr(original, _FREE_MEMORY_MARKER):
+        return
+
+    @functools.wraps(original)
+    def free_memory(dev=None, torch_free_too=False):
+        device = model_management.get_torch_device() if dev is None else dev
+        if getattr(device, "type", None) != "xpu":
+            return original(dev, torch_free_too)
+        physical_free, capacity = torch_module.xpu.mem_get_info(device)
+        stats = torch_module.xpu.memory_stats(device)
+        cached = max(0, int(stats["reserved_bytes.all.current"])
+                     - int(stats["active_bytes.all.current"]))
+        available = min(int(capacity), max(0, int(physical_free)) + cached)
+        return (available, cached) if torch_free_too else available
+
+    setattr(free_memory, _FREE_MEMORY_MARKER, original)
+    model_management.get_free_memory = free_memory
 
 
 def _load_argument(args, kwargs, name, position, default):
@@ -185,11 +214,13 @@ def apply():
         return False, "Windows only"
 
     import comfy.model_management
+    import torch
 
     required = (
         "current_loaded_models",
         "extra_reserved_memory",
         "get_free_memory",
+        "get_torch_device",
         "load_models_gpu",
         "minimum_inference_memory",
     )
@@ -197,8 +228,10 @@ def apply():
     if missing:
         return False, "missing ComfyUI hooks: " + ", ".join(missing)
 
+    if hasattr(torch.xpu, "mem_get_info"):
+        _patch_free_memory(comfy.model_management, torch)
     _patch_model_loader(comfy.model_management)
-    return True, "Windows XPU DynamicVRAM boundary reclaim enabled"
+    return True, "Windows XPU physical-memory budget and DynamicVRAM boundary reclaim enabled"
 
 
 __all__ = ["apply"]

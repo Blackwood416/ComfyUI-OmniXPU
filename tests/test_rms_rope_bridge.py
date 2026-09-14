@@ -108,5 +108,35 @@ def test_rms_rope_bridge():
     _run_standalone()
 
 
+def test_zimage_routing_and_exact_shape_fallback(monkeypatch):
+    import comfy_kitchen as ck
+    ck.disable_backend("triton")
+    monkeypatch.setenv("OMNIXPU_ZIMAGE_RMS_ROPE", "1")
+    module = _load_package_modules()
+    ok, reason = module.apply()
+    assert ok, reason
+    patched = ck.rms_rope
+    original = getattr(patched, module._PATCH_MARKER)
+    gen = torch.Generator().manual_seed(119)
+    packed = torch.randn((1, 4256, 3, 30, 128), dtype=torch.bfloat16, generator=gen).to("xpu")
+    q, k = packed[:, :, 0], packed[:, :, 1]
+    angle = torch.randn((1, 4256, 1, 64), generator=gen).to("xpu")
+    freqs = torch.stack((angle.cos(), -angle.sin(), angle.sin(), angle.cos()), -1).reshape(1, 4256, 1, 64, 2, 2)
+    scales = [torch.rand(128, dtype=torch.bfloat16, generator=gen).to("xpu") + 0.5 for _ in range(2)]
+    assert module._zimage_contract(q, k, freqs, *scales)
+    assert not module._zimage_contract(q.contiguous(), k, freqs, *scales)
+    assert not module._zimage_contract(q, k, freqs, scales[0], None)
+    with torch.inference_mode():
+        actual = patched(q, k, freqs, *scales, epsilon=1e-5)
+        expected = original(q, k, freqs, *scales, epsilon=1e-5)
+        for a, b in zip(actual, expected):
+            torch.testing.assert_close(a.cpu(), b.cpu(), rtol=0.02, atol=0.02)
+        assert module.get_stats()["zimage_routed"] == 1
+        before = module.get_stats()["fallback"]
+        patched(q[:, :64], k[:, :64], freqs[:, :64], *scales)
+        assert module.get_stats()["fallback"] == before + 1
+    torch.xpu.synchronize()
+
+
 if __name__ == "__main__":
     _run_standalone()

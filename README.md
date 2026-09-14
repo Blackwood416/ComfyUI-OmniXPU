@@ -225,6 +225,23 @@ Kitchen backend ownership can be inspected independently:
 python -c 'import comfy_kitchen as ck; print(ck.list_backends()["xpu"])'
 ```
 
+The INT8 fast forward uses ComfyUI's `cast_bias_weight` / `uncast_bias_weight`
+pair, including Dynamic VRAM residency and low-VRAM LoRA patches. It avoids
+the redundant activation quantize/dequantize round trip, without keeping a
+second GPU copy of CPU model weights. `OMNIXPU_INT8_FAST_FORWARD=0` disables
+this shortcut for comparison. The former `OMNIXPU_INT8_FAST_FORWARD_COPY*`
+and `OMNIXPU_INT8_QDATA_CACHE*` controls no longer apply: AIMDO owns weight
+residency, and its cast views must not be cached after unpinning.
+
+On A770, the RMS-RoPE adapter also fuses the measured 1024-square Z-Image
+(`B=1, S=4256, H=30, D=128`) and Krea2 (`B=1, S=4192, Hq=48, Hkv=12,
+D=128`) BF16 contracts. Other shapes use their existing routes. Krea2 keeps
+its FP32 `scale + 1` convention and BF16 rounding before RoPE, and preserves
+the ordinary projection casts, LoRA, grouped attention and output gate.
+Training, attention patches and intermediate forward hooks use the original
+Krea2 forward. `OMNIXPU_ZIMAGE_RMS_ROPE=0` and `OMNIXPU_KREA2_RMS_ROPE=0`
+disable the respective routes for comparison.
+
 ## SeedVR2 on A770
 
 The SeedVR2 adapters (from upstream #622 plus A770 validation) route:
@@ -245,8 +262,8 @@ The SeedVR2 adapters (from upstream #622 plus A770 validation) route:
 Measured end-to-end on A770 (`seedvr2_3b_int8_upscale_video.json`):
 681 s -> 607 s. Negatives recorded in `WHL_BUILD_INSTALL.md`: spatial tile
 1024 OOMs, temporal chunk 125 gives no gain, and lowering
-`OMNIXPU_INT8_FAST_FORWARD_COPY_MIN_ELEMS` below 16 Mi does not speed up
-sampling.
+the former `OMNIXPU_INT8_FAST_FORWARD_COPY_MIN_ELEMS` below 16 Mi did not
+speed up sampling. Those copy controls have since been removed.
 
 ## Contribution boundary
 
