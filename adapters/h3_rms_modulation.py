@@ -1,0 +1,516 @@
+"""Route the exact MiniMax H3 RMSNorm/modulation boundary to Omni XPU."""
+
+from __future__ import annotations
+
+import inspect
+import logging
+import sys
+from functools import wraps
+from typing import Any, Callable
+
+import torch
+
+from ..patches.debug import log_debug_event, trace_patch
+
+
+log = logging.getLogger("ComfyUI-OmniXPU")
+
+_PATCH_MARKER = "__omnixpu_h3_rms_modulation_original__"
+_KJ_PATCH_MARKER = "__omnixpu_kj_lowmem_block_original__"
+_HIDDEN_SIZE = 5376
+_MODULATION_EXPAND = 6
+# Upstream caps this at 8; reference-video H3 workflows pack 13+ ordered
+# segments, and the A-series kernel build admits up to 32.
+_MAX_SEGMENTS = 32
+_omni_norm = None
+_backend_label = "bmg_sycl"
+_policy_supported: Callable[[torch.Tensor], bool] | None = None
+_routed_calls = 0
+_fallback_calls = 0
+_fallback_reasons: dict[str, int] = {}
+
+
+def _record_fallback(reason: str) -> None:
+    global _fallback_calls
+    if torch.compiler.is_compiling():
+        return
+    _fallback_calls += 1
+    _fallback_reasons[reason] = _fallback_reasons.get(reason, 0) + 1
+
+
+def get_stats() -> dict[str, Any]:
+    return {
+        "routed": _routed_calls,
+        "fallback": _fallback_calls,
+        "reasons": dict(_fallback_reasons),
+    }
+
+
+def _forward_api_reason(function: Callable[..., Any]) -> str:
+    # Registration needs the supported call API, not a particular source-file
+    # spelling. Installed-source tests separately check the upstream model math.
+    try:
+        parameters = tuple(inspect.signature(function).parameters.values())
+    except (TypeError, ValueError):
+        return "MiniMax H3 DiTBlock.forward signature is unavailable"
+    names = (
+        "self", "x", "t_emb", "mod_segments", "rope_freqs",
+        "transformer_options",
+    )
+    if len(parameters) == len(names) + 1:
+        attention = parameters[-1]
+        if (
+            attention.name != "attention"
+            or attention.default is not None
+            or attention.kind != inspect.Parameter.POSITIONAL_OR_KEYWORD
+        ):
+            return "MiniMax H3 DiTBlock.forward API is unsupported"
+        parameters = parameters[:-1]
+    if (
+        tuple(parameter.name for parameter in parameters) != names
+        or any(
+            parameter.kind != inspect.Parameter.POSITIONAL_OR_KEYWORD
+            for parameter in parameters
+        )
+        or any(
+            parameter.default is not inspect.Parameter.empty
+            for parameter in parameters[:-1]
+        )
+        or not isinstance(parameters[-1].default, dict)
+        or parameters[-1].default
+    ):
+        return "MiniMax H3 DiTBlock.forward API is unsupported"
+    return ""
+
+
+def _segment_reason(segments: Any, rows: int, modulation_rows: int) -> str:
+    if not isinstance(segments, (tuple, list)):
+        return "segment_type"
+    if not 1 <= len(segments) <= _MAX_SEGMENTS:
+        return "segment_count"
+    previous_stop = 0
+    for segment in segments:
+        if not isinstance(segment, (tuple, list)) or len(segment) != 3:
+            return "segment_shape"
+        if any(type(value) is not int for value in segment):
+            return "segment_value_type"
+        start, stop, modulation_row = segment
+        if start != previous_stop or stop <= start:
+            return "segment_coverage"
+        if not 0 <= modulation_row < modulation_rows:
+            return "segment_modulation_row"
+        previous_stop = stop
+    if previous_stop != rows:
+        return "segment_coverage"
+    return ""
+
+
+def _block_input_reason(block: Any, x: Any, segments: Any) -> str:
+    if not isinstance(x, torch.Tensor):
+        return "input_type"
+    if x.dtype != torch.bfloat16:
+        return "input_dtype"
+    if x.ndim != 2 or x.shape[0] <= 0 or x.shape[1] != _HIDDEN_SIZE:
+        return "input_shape"
+    if not x.is_contiguous():
+        return "input_layout"
+    if x.requires_grad:
+        return "requires_grad"
+    for name in ("norm1", "norm2"):
+        layer = getattr(block, name, None)
+        if layer is None:
+            return f"{name}_missing"
+        normalized_shape = getattr(layer, "normalized_shape", None)
+        try:
+            normalized_shape = tuple(normalized_shape)
+        except TypeError:
+            return f"{name}_shape"
+        if normalized_shape != (_HIDDEN_SIZE,):
+            return f"{name}_shape"
+        weight = getattr(layer, "weight", None)
+        if weight is None or tuple(weight.shape) != (_HIDDEN_SIZE,):
+            return f"{name}_weight"
+    return _segment_reason(segments, x.shape[0], 1 << 30)
+
+
+def _modulation_reason(values: Any, x: torch.Tensor, segments: Any) -> str:
+    if not isinstance(values, (tuple, list)) or len(values) != _MODULATION_EXPAND:
+        return "adaln_outputs"
+    expected_stride = (_MODULATION_EXPAND * _HIDDEN_SIZE, 1)
+    rows = None
+    for value in values:
+        if not isinstance(value, torch.Tensor):
+            return "modulation_type"
+        if value.device != x.device or value.dtype not in (
+            torch.bfloat16, torch.float32
+        ):
+            return "modulation_device_dtype"
+        if value.ndim != 2 or value.shape[1] != _HIDDEN_SIZE:
+            return "modulation_shape"
+        if tuple(value.stride()) != expected_stride:
+            return "modulation_layout"
+        if value.requires_grad:
+            return "modulation_requires_grad"
+        if rows is None:
+            rows = value.shape[0]
+        elif value.shape[0] != rows:
+            return "modulation_rows"
+    return _segment_reason(segments, x.shape[0], int(rows))
+
+
+def _weight_reason(weight: Any, bias: Any, x: torch.Tensor) -> str:
+    if bias is not None:
+        return "norm_bias"
+    if not isinstance(weight, torch.Tensor):
+        return "norm_weight_type"
+    if weight.device != x.device or weight.dtype != torch.bfloat16:
+        return "norm_weight_device_dtype"
+    if weight.ndim != 1 or weight.numel() != _HIDDEN_SIZE:
+        return "norm_weight_shape"
+    if not weight.is_contiguous():
+        return "norm_weight_layout"
+    return ""
+
+
+def _run_fused(
+    comfy_ops: Any,
+    layer: Any,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    segments: list[tuple[int, int, int]],
+) -> tuple[torch.Tensor | None, str]:
+    comfy_ops.run_every_op()
+    context = comfy_ops.CastBiasWeightContext(
+        layer if layer.weight is not None else None,
+        x,
+        offloadable=True,
+    )
+    with context as (weight, bias):
+        reason = _weight_reason(weight, bias, x)
+        if reason:
+            return None, reason
+        eps = layer.eps if layer.eps is not None else 1e-6
+        # Curve-based H3 checkpoints produce FP32 modulation. Match the
+        # original _mod_scale_shift: cast before 1 + scale and before shift
+        # addition, while leaving the original gate path untouched.
+        output = _omni_norm.rms_norm_segmented_modulation(
+            weight,
+            x,
+            scale.to(dtype=x.dtype),
+            shift.to(dtype=x.dtype),
+            segments,
+            eps=eps,
+        )
+    return output, ""
+
+
+def _rms_modulation(
+    comfy_ops: Any,
+    original_modulate: Callable[..., Any],
+    layer: Any,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    segments: list[tuple[int, int, int]],
+    reason: str,
+) -> tuple[torch.Tensor, int]:
+    global _routed_calls
+
+    # Cast helpers execute these hooks. Let the original norm own that call
+    # once instead of probing a hook result and then invoking the norm again.
+    if not reason and len(getattr(layer, "weight_function", ())) > 0:
+        reason = "norm_weight_function"
+    if not reason and len(getattr(layer, "bias_function", ())) > 0:
+        reason = "norm_bias_function"
+    if not reason:
+        output, reason = _run_fused(comfy_ops, layer, x, scale, shift, segments)
+        if output is not None:
+            # Eager diagnostics must not become mutable Dynamo guards.
+            if not torch.compiler.is_compiling():
+                _routed_calls += 1
+            return output, 1
+
+    # Once AdaLN or a residual update has run, keep fallback at this operator
+    # boundary. Replaying the block would repeat projection or in-place gates.
+    _record_fallback(reason)
+    return original_modulate(layer(x), shift, scale, segments), 0
+
+
+def _fused_block_forward(
+    comfy_ops: Any,
+    h3_model: Any,
+    block: Any,
+    x: torch.Tensor,
+    t_emb: torch.Tensor,
+    mod_segments: Any,
+    rope_freqs: Any,
+    transformer_options: Any,
+    attention: Any,
+    *,
+    lowmem_h_list: bool,
+) -> torch.Tensor:
+    """Shared H3 block body with the two norm layers routed through the kernel.
+
+    ``lowmem_h_list`` mirrors KJNodes' MiniMaxLowVRAMAttention variant, which
+    hands the normed activation to attention inside a one-element list so the
+    attention implementation can free the fused qkv buffer earlier.
+    """
+    modulation = block.adaln_proj(t_emb)
+    reason = _modulation_reason(modulation, x, mod_segments)
+    (
+        shift_msa,
+        scale_msa,
+        gate_msa,
+        shift_mlp,
+        scale_mlp,
+        gate_mlp,
+    ) = modulation
+
+    h, first_fused = _rms_modulation(
+        comfy_ops,
+        h3_model._mod_scale_shift,
+        block.norm1,
+        x,
+        scale_msa,
+        shift_msa,
+        mod_segments,
+        reason,
+    )
+
+    attention_module = block.attn if attention is None else attention
+    attention_input = [h] if (lowmem_h_list and attention is None) else h
+    x = h3_model._mod_gate(
+        x,
+        gate_msa,
+        attention_module(
+            attention_input,
+            rope_freqs=rope_freqs,
+            transformer_options=transformer_options,
+        ),
+        mod_segments,
+    )
+    h, second_fused = _rms_modulation(
+        comfy_ops,
+        h3_model._mod_scale_shift,
+        block.norm2,
+        x,
+        scale_mlp,
+        shift_mlp,
+        mod_segments,
+        reason,
+    )
+    output = h3_model._mod_gate(
+        x,
+        gate_mlp,
+        block.mlp(h),
+        mod_segments,
+    )
+
+    fused_calls = first_fused + second_fused
+    if fused_calls:
+        log_debug_event(
+            "kernel",
+            "h3_rms_norm_segmented_modulation",
+            {"input": x, "output": output},
+            details={
+                "backend": _backend_label,
+                "segments": len(mod_segments),
+                "fused_calls": fused_calls,
+            },
+        )
+    return output
+
+
+def _install_kjnodes_composition(
+    comfy_ops: Any, h3_model: Any, model_management: Any
+) -> tuple[bool, str]:
+    """Route KJNodes' low-VRAM block forward through the fused kernel too.
+
+    MiniMaxLowVRAMAttention installs ``diffusion_model.blocks.N.forward`` object
+    patches that re-implement the block body, so a class-level patch of
+    ``DiTBlock.forward`` never runs in those workflows. Replace the helper the
+    node binds at execution time and keep its list-passing contract.
+    """
+    for module in list(sys.modules.values()):
+        original = getattr(module, "minimax_block_lowmem_forward", None)
+        if callable(original):
+            break
+    else:
+        return False, "KJNodes low-VRAM block forward is not loaded"
+    if hasattr(original, _KJ_PATCH_MARKER):
+        return True, "already composed"
+
+    @wraps(original)
+    def patched(
+        self,
+        x,
+        t_emb,
+        mod_segments,
+        rope_freqs,
+        transformer_options={},
+        attention=None,
+    ):
+        if _policy_supported is None or not _policy_supported(x):
+            return original(
+                self, x, t_emb, mod_segments, rope_freqs,
+                transformer_options=transformer_options, attention=attention,
+            )
+        reason = _block_input_reason(self, x, mod_segments)
+        if reason or model_management.in_training:
+            _record_fallback(reason or "training")
+            return original(
+                self, x, t_emb, mod_segments, rope_freqs,
+                transformer_options=transformer_options, attention=attention,
+            )
+        return _fused_block_forward(
+            comfy_ops,
+            h3_model,
+            self,
+            x,
+            t_emb,
+            mod_segments,
+            rope_freqs,
+            transformer_options,
+            attention,
+            lowmem_h_list=True,
+        )
+
+    setattr(patched, _KJ_PATCH_MARKER, original)
+    module.minimax_block_lowmem_forward = patched
+    log.info(
+        "[OmniXPU] norm: composed with KJNodes MiniMaxLowVRAMAttention "
+        "block forward"
+    )
+    return True, ""
+
+
+def apply():
+    global _omni_norm, _backend_label, _policy_supported
+
+    try:
+        import omni_xpu_kernel as package
+        from omni_xpu_kernel import norm as candidate
+    except ImportError:
+        return False, "omni_xpu_kernel segmented RMS modulation is unavailable"
+    # The kernel is the same ESIMD source on every target; report the target
+    # actually built instead of upstream's BMG-only label.
+    _backend_label = f"{getattr(package, '__xpu_target__', '') or 'xpu'}_sycl"
+    capability = getattr(
+        candidate, "supports_rms_norm_segmented_modulation", None
+    )
+    if not callable(capability) or not capability():
+        return False, "native segmented RMS modulation is unavailable"
+    policy_supported = getattr(
+        candidate, "rms_norm_segmented_modulation_supported", None
+    )
+    if not callable(policy_supported):
+        return False, "native segmented RMS modulation policy is unavailable"
+    _policy_supported = policy_supported
+    if not callable(getattr(candidate, "rms_norm_segmented_modulation", None)):
+        return False, "native segmented RMS modulation operation is unavailable"
+
+    try:
+        import comfy.model_management
+        import comfy.ops as comfy_ops
+        import comfy.ldm.minimax.model as h3_model
+    except ImportError:
+        return False, "MiniMax H3 ComfyUI model is unavailable"
+    if not all(callable(getattr(comfy_ops, name, None)) for name in (
+        "CastBiasWeightContext", "run_every_op",
+    )):
+        return False, "ComfyUI cast/offload helpers are unavailable"
+    if not all(callable(getattr(h3_model, name, None)) for name in (
+        "_mod_scale_shift", "_mod_gate",
+    )):
+        return False, "MiniMax H3 modulation helpers are unavailable"
+
+    target = getattr(h3_model, "DiTBlock", None)
+    if target is None or not callable(getattr(target, "forward", None)):
+        return False, "MiniMax H3 DiTBlock.forward is unavailable"
+    original = target.forward
+    if hasattr(original, _PATCH_MARKER):
+        return True, "already patched"
+    reason = _forward_api_reason(original)
+    if reason:
+        return False, reason
+
+    _omni_norm = candidate
+    accepts_attention = "attention" in inspect.signature(original).parameters
+
+    @wraps(original)
+    def patched(
+        self,
+        x,
+        t_emb,
+        mod_segments,
+        rope_freqs,
+        transformer_options={},
+        attention=None,
+    ):
+        attention_kwargs = {"attention": attention} if accepts_attention else {}
+        if attention is not None and not accepts_attention:
+            raise TypeError("this MiniMax H3 forward API has no attention override")
+        if not policy_supported(x):
+            return original(
+                self,
+                x,
+                t_emb,
+                mod_segments,
+                rope_freqs,
+                transformer_options=transformer_options,
+                **attention_kwargs,
+            )
+
+        reason = _block_input_reason(self, x, mod_segments)
+        if reason or comfy.model_management.in_training:
+            _record_fallback(reason or "training")
+            return original(
+                self,
+                x,
+                t_emb,
+                mod_segments,
+                rope_freqs,
+                transformer_options=transformer_options,
+                **attention_kwargs,
+            )
+
+        return _fused_block_forward(
+            comfy_ops,
+            h3_model,
+            self,
+            x,
+            t_emb,
+            mod_segments,
+            rope_freqs,
+            transformer_options,
+            attention,
+            lowmem_h_list=False,
+        )
+
+    patched = trace_patch(
+        "norm.H3DiTBlock.rms_modulation",
+        ("self", "x", "t_emb", "mod_segments", "rope_freqs"),
+        stage="dispatch",
+        verbose_only=True,
+    )(patched)
+    setattr(patched, _PATCH_MARKER, original)
+    target.forward = patched
+    log.info("[OmniXPU] norm: patched MiniMax H3 segmented RMS modulation")
+    # KJNodes' low-VRAM node replaces the per-block forward through object
+    # patches, which win over this class-level patch; compose with it when the
+    # plugin is loaded so both routes keep working.
+    try:
+        composed, detail = _install_kjnodes_composition(
+            comfy_ops, h3_model, comfy.model_management
+        )
+    except Exception as exc:  # noqa: BLE001 - optional composition
+        composed, detail = False, f"KJNodes composition failed: {exc}"
+    if composed:
+        log.info("[OmniXPU] norm: %s", detail or "KJNodes composition applied")
+    else:
+        log.info("[OmniXPU] norm: KJNodes composition skipped (%s)", detail)
+    return True, ""
+
+
+__all__ = ["apply", "get_stats"]
