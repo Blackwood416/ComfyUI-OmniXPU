@@ -404,15 +404,21 @@ def apply():
         # -- Intercept 3: linear_input_act (SwiGLU + down projection) --
         _orig_linear_input_act = comfy_ops.linear_input_act
 
-        def _patched_linear_input_act(linear, x, input_act):
-            if input_act == "swiglu" and _int8_skip_reason(
-                linear, x, QuantizedTensor, TensorWiseINT8Layout,
-            ) is None:
+        def _patched_linear_input_act(linear, x, input_act, *args, **kwargs):
+            # ComfyUI 0.36 extended this signature (act_weight / act_eps /
+            # residual / residual_scale; see comfy/ldm/minimax/vae.py rms_norm
+            # calls). Only the original 3-argument swiglu call goes through the
+            # int8 fast path; anything else is forwarded to the original
+            # implementation untouched.
+            if (not args and not kwargs and input_act == "swiglu"
+                    and _int8_skip_reason(
+                        linear, x, QuantizedTensor, TensorWiseINT8Layout,
+                    ) is None):
                 return _int8_forward_cast(
                     comfy_ops, linear, x, QuantizedTensor,
                     TensorWiseINT8Layout, input_act=input_act,
                 )
-            return _orig_linear_input_act(linear, x, input_act)
+            return _orig_linear_input_act(linear, x, input_act, *args, **kwargs)
 
         comfy_ops.linear_input_act = _patched_linear_input_act
 
