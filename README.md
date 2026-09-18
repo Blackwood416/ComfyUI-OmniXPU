@@ -187,6 +187,56 @@ to Kitchen/native primitives. It does not register `comfy_kitchen::int8_linear`
 and does not replace a model pipeline. LoRA, offloaded weights, bias, training,
 unsupported layouts, and unsupported shapes retain ComfyUI's original route.
 
+## torch.compile on A770
+
+The kernel wheel ships Dynamo dispatch boundaries (`omni_xpu_kernel._compile_ops`,
+`torch.ops.omni_xpu.*`) so the native kernels are opaque custom operators inside
+a compiled graph. Without them Dynamo cannot trace a quantized checkpoint.
+
+Enable it in a workflow with ComfyUI's own `TorchCompileModel` node
+(`backend=inductor`) between the model loader and the sampler. Two requirements:
+
+- Inductor needs a C++ compiler on `PATH`; start ComfyUI from a shell that has
+  run `...\VC\Auxiliary\Build\vcvars64.bat`, otherwise compilation fails with
+  `InvalidCxxCompiler: Compiler: cl is not found`.
+- Point `TORCHINDUCTOR_CACHE_DIR` at a stable directory. The default on Windows
+  is `%TEMP%\torchinductor_<user>`, which system cleanup can remove.
+
+While tracing, the adapter defers to ComfyUI's own quantized dispatch and skips
+the eager fp8 / int8 fast paths: those paths specialise on every weight shape
+(one graph per layer until Dynamo hits its per-code recompile limit and falls
+back to eager), and keeping them out of the graph with a graph break trips
+Dynamo's `transformer_options` resume path (`KeyError: 'total_blocks'` on
+Krea2). Eager execution is unchanged.
+
+Measured on Arc A770, Krea2 turbo int8 convrot with the fp8 text encoder
+(768x1280, 8 steps):
+
+| scenario | eager | torch.compile (inductor) |
+|---|---|---|
+| first run, empty cache | 30.8 s | 195 s (compile) |
+| restart, disk cache present | 30.8 s | 43.7 s |
+| in-process second run | 21.7 s | 17.9 s |
+
+The compile cost is paid once per graph and shape; it pays off when a session
+runs many images at the same resolution, not for one-off generations.
+
+### Compiled models bypass AIMDO's dynamic VRAM
+
+ComfyUI's `TorchCompileModel` clones the patcher with `disable_dynamic=True`
+because a compiled graph captures weight addresses once; weights cannot be
+paged or re-cast per call afterwards. The compiled model is therefore loaded
+statically (`Model <name> prepared for dynamic VRAM loading` never appears for
+it in the log) while everything else in the process keeps using AIMDO's
+dynamic VRAM path.
+
+That is a trade-off, not a bug: compile only helps models that fit in VRAM as
+a resident copy. On a 16 GB A770, a 12.8 GB INT8 DiT can be compiled (the text
+encoder stays dynamic), while a 32 GB H3 checkpoint cannot and must keep using
+AIMDO's dynamic VM. Upstream's runtime bootstrap states the same limitation in
+one line: `AIMDO memory compiler is not yet supported on XPU; DynamicVRAM
+model-weight offloading is available. This does not disable torch.compile.`
+
 ## Debugging and diagnostics
 
 Kernel-only tracing:
