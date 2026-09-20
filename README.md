@@ -47,6 +47,9 @@ The official upstream README is preserved in
 | Kitchen XPU backend | INT8/QTensor operations, FP8 QDQ and stochastic rounding, SVDQuant, AdaLN, four RoPE APIs, and ConvRot |
 | ComfyUI adapter | Attention routing, LayerNorm/RMSNorm class integration, the remaining FP8 model/factory bridge, and fused Lumina/Z-Image INT8 FFN wiring |
 | Memory adapter | Cached whole-LoRA model budgets plus optional DynamicVRAM per-layer XPU staging measurements |
+| SeedVR2 capacity | Guarded Ada broadcast plus byte-bounded RMSNorm, SwiGLU, and window-attention materialization |
+| SeedVR2 native adapters | Validated BMG FP16 GroupNorm and causal-prefix cat-pad routing |
+| Large-video preprocessing | Source-guarded, bounded CPU materialization for PIL Lanczos resize, SeedVR input padding, and XPU VAE input staging |
 | Legacy fix | Global `F.interpolate` and `torch.median`/`torch.nanmedian` workarounds; disabled by default |
 
 RoPE, generic INT8 linear dispatch, and the old FP8 negative-zero wrapper are
@@ -54,6 +57,11 @@ normally not registered by this custom node. The A770/DG2 compatibility
 profile is the narrow exception: when Kitchen has no XPU implementation for
 `comfy_kitchen::int8_linear`, the adapter registers the Omni implementation.
 It skips registration when a Kitchen XPU backend is already present.
+
+ComfyUI's quantized-format eligibility recognizes `int8_tensorwise` when the
+active Kitchen XPU backend provides its native INT8 and ConvRot operations.
+Model requests for full-precision matrix multiplication still apply. Other
+quantized formats retain ComfyUI's own eligibility decisions.
 
 ## Install
 
@@ -78,6 +86,62 @@ If an Intel XPU is unavailable, initialization is skipped.
 
 The A770 bridge requires the normal `comfy_kitchen` package that ships with
 ComfyUI, but does not require a separate `comfy-kitchen-xpu` installation.
+## Official packages and XPU providers
+
+The provider distributions use private top-level package names and do not own
+any `comfy_kitchen/*` or `comfy_aimdo/*` file. The official packages can
+therefore be reinstalled or upgraded without overwriting the XPU runtime.
+ComfyUI's launcher and Python entry point are unchanged.
+
+During the normal custom-node prestartup phase, OmniXPU discovers lightweight
+provider metadata before importing PyTorch. It verifies the official package
+version, exact Torch XPU build, platform and image target, source revision,
+source-wheel hash, and every vendored runtime file hash. Kitchen is then routed
+only when its canonical package is first imported.
+
+AIMDO takeover additionally requires explicit DynamicVRAM enablement, an
+unimported PyTorch runtime on Linux, and an official `comfy_aimdo.control`
+module with no device context or allocator. ComfyUI calls official AIMDO init
+before custom-node prestartup; on an XPU Torch build that can leave only its
+pre-device CUDA DSO state live. OmniXPU permits exactly that reversible state,
+calls the official public `deinit()`, and verifies that it returned to a
+pristine module before takeover. Any device or allocator state is rejected.
+OmniXPU then executes the provider control implementation in that same module
+object so the reference imported by ComfyUI remains valid. A reversible
+provider failure restores the deinitialized official module. A failure after
+provider allocator or native state becomes live stops startup because
+allocator ownership cannot be rolled back safely.
+
+Provider routing defaults to `auto` and can be controlled without changing the
+launcher:
+
+```bash
+OMNIXPU_PROVIDER_BOOTSTRAP=off       # Keep every official runtime
+OMNIXPU_PROVIDER_BOOTSTRAP=auto      # Use each compatible XPU provider
+OMNIXPU_PROVIDER_BOOTSTRAP=required  # Fail unless both providers activate
+```
+
+After an official package upgrade, an incompatible provider is skipped in
+`auto` mode instead of being forced into a new API contract. Upgrade the
+corresponding provider wheel to restore XPU routing.
+
+The image's Linux provider defaults to `native_hook`, keeping Torch's native
+XPU allocator while AIMDO manages DynamicVRAM weights. The standard
+`start_comfyui.sh` entrypoint validates the provider, resolves its default and
+preloads its exact native library before starting Python. Set
+`AIMDO_XPU_ALLOCATOR_MODE=global` to select the Linux pluggable allocator.
+Older providers retain their own advertised default.
+
+Native mode requires DynamicVRAM and fails startup if activation fails after
+selection; it cannot silently fall back to another memory policy. Direct Python
+launchers enabling DynamicVRAM must also prepare the native preload before
+startup. Allocator modes do not change the model graph or enable XPU memory
+compilation.
+
+AIMDO 0.5.3 memory compilation (recording and replaying allocation graphs) is
+not yet supported on XPU. Its basic APIs and DynamicVRAM model-weight
+offloading remain available. This limitation does not disable OmniXPU's
+`torch.compile` support.
 
 ## Components and switches
 
@@ -87,15 +151,21 @@ for unsupported inputs:
 ```bash
 OMNIXPU_ENABLE=0            # Disable every custom-node component
 OMNIXPU_ATTENTION=0         # Disable the attention adapter
+OMNIXPU_SPARSE_ATTENTION=0  # Disable XPU eligibility for Model Sparse Attention
 OMNIXPU_NORM=0              # Disable the norm adapter
 OMNIXPU_RMS_ROPE=0          # Disable the A770 RMS-RoPE bridge
 OMNIXPU_FP8_GEMM=0          # Disable the temporary FP8 model/factory adapter
+OMNIXPU_QUANTIZED_MATMUL=0  # Disable native INT8 model-format eligibility
 OMNIXPU_INT8_FFN=0          # Disable fused Lumina/Z-Image INT8 FFN wiring
 OMNIXPU_DYNAMIC_VRAM_BOUNDARY_TRIM=0  # Disable Windows XPU model-boundary trim
 OMNIXPU_LORA_MEMORY=0       # Disable cached whole-LoRA budgets and staging logs
 OMNIXPU_KITCHEN_COMPAT=0    # Disable the A770 missing-backend bridge
 OMNIXPU_INT8_DIRECT_CAST=1  # A770 opt-in: keep offloaded TensorWise INT8 on the quantized path
 OMNIXPU_INT8_PATCH_CACHE=1  # A770 opt-in: cache patched bf16 weights across sampling steps
+OMNIXPU_SEEDVR_ADA_RESHAPE=0  # Disable the guarded SeedVR2 Ada reshape patch
+OMNIXPU_SEEDVR_CAPACITY=0     # Disable bounded SeedVR2 activation scheduling
+OMNIXPU_SEEDVR_CAT_PAD=0      # Disable validated BMG causal-prefix cat-pad routing
+OMNIXPU_LARGE_VIDEO_PREPROCESS=0  # Disable bounded large-video CPU preprocessing
 ```
 
 On Windows XPU, the boundary trim turns an unmet DynamicVRAM minimum-memory
@@ -110,7 +180,12 @@ OMNI_ATTN_BACKEND=auto      # auto, cute, esimd, or torch; Windows defaults to t
 OMNIXPU_NONCONTIG_RMSNORM=0
 OMNIXPU_H120_RMSNORM=0
 OMNIXPU_KREA2_RMSNORM=0
+OMNIXPU_SEEDVR_GROUPNORM=0
 ```
+
+On Windows, CUTE is never selected implicitly. A wheel built explicitly with
+`OMNI_XPU_REQUIRE_CUTE=1` still uses PyTorch SDPA by default; set
+`OMNI_ATTN_BACKEND=cute` before launching ComfyUI to enable the CUTE routes.
 
 For diagnostics, the per-call CUTE output scan can be enabled explicitly. It
 is disabled by default because validated CUTE routes accumulate in FP32 and a
@@ -237,6 +312,38 @@ AIMDO's dynamic VM. Upstream's runtime bootstrap states the same limitation in
 one line: `AIMDO memory compiler is not yet supported on XPU; DynamicVRAM
 model-weight offloading is available. This does not disable torch.compile.`
 
+## Model Sparse Attention
+
+Use the upstream **Model Sparse Attention** node (`BlockSparseAttention`)
+with a matching complete native sparse API for SOL, SLA and VSA on XPU. Its
+generic Sol/SLA path and MiniMax-H3 chunked producer call Kitchen's public APIs. The upstream node owns block selection,
+4096-token projection chunks, previous-step statistics, VSA tiling and cleanup.
+The adapter only extends its device eligibility checks. An unavailable native
+API or an unsupported upstream eligibility contract leaves the original node
+behavior in place.
+
+See [native sparse attention usage](../docs/SPARSE_ATTENTION.md) for model
+connections, trained SLA/VSA recipes, fallback diagnostics and migration from
+the deprecated **Patch Sol-Attn** custom node. The old experimental environment
+gate is not needed; `OMNIXPU_SPARSE_ATTENTION` controls this adapter.
+
+## Native compiled inference
+
+Upstream `TorchCompileModel` clones the diffusion model with
+`disable_dynamic=True`. That clone does not disable service-wide DynamicVRAM
+for text encoding or VAE execution. Match the service memory mode and model
+cloning when comparing eager and compiled performance; use ComfyUI's separate
+`--disable-dynamic-vram` option when explicitly selecting a service without
+DynamicVRAM.
+
+Compiled FP16/BF16 pointwise operations can round differently from eager even
+when each native operator matches. See the kernel package's
+[compiled-inference guidance](../omni_xpu_kernel/README.md#compiled-inference).
+On an installed Torch build that supports the option,
+`TORCHINDUCTOR_EMULATE_PRECISION_CASTS=1` before ComfyUI startup selects eager
+precision emulation for that process. This is an explicit numerical policy to
+validate for the model, not a default enabled by OmniXPU.
+
 ## Debugging and diagnostics
 
 Kernel-only tracing:
@@ -263,11 +370,25 @@ staging operation, including its XPU state and any failure, enable:
 OMNIXPU_LORA_MEMORY_TRACE=1 python main.py
 ```
 
+LoRA memory logs report `xpu_memory=available`, `partial`, or `unavailable`
+for the diagnostic snapshot, not GPU availability. Allocator counters and
+device free/total memory are queried independently; successful values remain
+visible if another query fails. Missing values are listed rather than reported
+as zero, and query errors include the interface, exception type and message.
+Statistics failures do not change LoRA budgets or interrupt model loading.
+
 Set tracing variables before startup. The **OmniXPU Status** node reports:
 
 - GPU and `omni_xpu_kernel` capabilities;
-- each component's kind (`adapter` or `legacy_fix`) and apply status;
+- runtime-provider activation, skip, and rejection reasons;
+- each component's kind (`adapter`, `compatibility_patch`, or `legacy_fix`)
+  and apply status;
 - attention and fused INT8 FFN routing counters.
+
+Attention, INT8 FFN and H3 RMS modulation counters record eager calls. During `torch.compile`,
+these diagnostic counters and logs are excluded from tracing so changing a
+counter cannot cause recompilation. Use the Torch profiler's operator events
+to inspect compiled native calls.
 
 Kitchen backend ownership can be inspected independently:
 

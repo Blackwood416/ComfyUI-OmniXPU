@@ -196,7 +196,9 @@ def apply():
     if probe.linear_fp8 is None:
         return False, "omni_xpu_kernel linear_fp8 not available"
     _omni_fp8_linear = probe.linear_fp8
-    _omni_int8 = probe.int8
+    # The INT8 fast path is optional: a probe without the int8 module keeps
+    # ComfyUI's own quantized dispatch (see _int8_skip_reason).
+    _omni_int8 = getattr(probe, "int8", None)
     log.info(
         "[OmniXPU] int8 fast forward: %s (Comfy cast with Dynamic VRAM/LoRA)",
         "enabled" if _INT8_FAST_FORWARD else "disabled (OMNIXPU_INT8_FAST_FORWARD=0)",
@@ -402,7 +404,8 @@ def apply():
         comfy_ops.mixed_precision_ops = _patched_mixed
 
         # -- Intercept 3: linear_input_act (SwiGLU + down projection) --
-        _orig_linear_input_act = comfy_ops.linear_input_act
+        # ComfyUI builds before this helper existed keep their own path.
+        _orig_linear_input_act = getattr(comfy_ops, "linear_input_act", None)
 
         def _patched_linear_input_act(linear, x, input_act, *args, **kwargs):
             # ComfyUI 0.36 extended this signature (act_weight / act_eps /
@@ -420,6 +423,7 @@ def apply():
                 )
             return _orig_linear_input_act(linear, x, input_act, *args, **kwargs)
 
-        comfy_ops.linear_input_act = _patched_linear_input_act
+        if _orig_linear_input_act is not None:
+            comfy_ops.linear_input_act = _patched_linear_input_act
 
     return True, None

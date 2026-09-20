@@ -6,6 +6,7 @@ the direct fast path is used only when weight and bias hooks are absent.
 """
 
 import logging
+import math
 import os
 
 import torch
@@ -23,6 +24,7 @@ _allow_noncontiguous_rms = False
 _allow_h120_rms = False
 _allow_bmg_group_norm = False
 _allow_seedvr_group_norm = False
+_is_dg2_target = False
 _RMS_CHUNK_THRESHOLD_BYTES = 4 * 1024**3
 _RMS_CHUNK_INPUT_BYTES = 320 * 1024**2
 _bmg_group_norm_shapes = {
@@ -140,12 +142,7 @@ def _rms_input_2d(x):
     # torch for many short rows (e.g. MiniMax H3 q/k norm is [S*56, 128]).
     # Keep the native route for normal hidden widths and fall back to torch
     # for this high-row-count short-row pattern.
-    try:
-        import omni_xpu_kernel as _omni_package
-        _is_dg2 = getattr(_omni_package, "__xpu_target__", "") == "dg2"
-    except ImportError:
-        _is_dg2 = False
-    if _is_dg2 and h == 128 and x.numel() // h >= 65536:
+    if _is_dg2_target and h == 128 and math.prod(x.shape[:-1]) >= 65536:
         return None
     if not x.is_contiguous():
         # Lumina/Z-Image Q and K are views into a combined QKV projection. The
@@ -267,6 +264,7 @@ def _run_seedvr_group_norm(x, num_groups, weight, bias, eps):
 def apply():
     global _allow_bmg_group_norm, _allow_seedvr_group_norm
     global _allow_h120_rms, _allow_noncontiguous_rms, _omni_norm
+    global _is_dg2_target
     import sys
     probe = sys.modules.get("ComfyUI-OmniXPU.probe")
     if probe.norm is None:
@@ -276,6 +274,7 @@ def apply():
         import omni_xpu_kernel as _omni_package
 
         target = getattr(_omni_package, "__xpu_target__", "")
+        _is_dg2_target = target == "dg2"
         _allow_noncontiguous_rms = (
             _target_supports_noncontiguous_rms(target)
             and os.environ.get("OMNIXPU_NONCONTIG_RMSNORM", "1") != "0"
