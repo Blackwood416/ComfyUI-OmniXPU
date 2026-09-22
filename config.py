@@ -84,6 +84,10 @@ class Config:
             master
             and os.environ.get("OMNIXPU_H3_SAMPLING_PREFETCH", "1") != "0"
         )
+        self.cast_buffer_lifetime = (
+            master
+            and os.environ.get("OMNIXPU_CAST_BUFFER_LIFETIME", "1") != "0"
+        )
 
 
 config = Config()

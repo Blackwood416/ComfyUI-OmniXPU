@@ -190,6 +190,13 @@ COMPONENTS = (
         "ComfyUI-OmniXPU",
         "adapters/sampling_prefetch.py",
     ),
+    Component(
+        "cast_buffer_lifetime",
+        "cast_buffer_lifetime",
+        "adapter",
+        "A770 compatibility",
+        "adapters/cast_buffer_lifetime.py",
+    ),
 )
 
 

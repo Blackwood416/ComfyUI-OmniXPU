@@ -89,9 +89,8 @@ def _minimum_memory_target(model_management, args, kwargs):
     minimum_required = _minimum_memory_required_argument(args, kwargs)
     reserved = model_management.extra_reserved_memory()
     inference = model_management.minimum_inference_memory()
-    if minimum_required is None:
-        return max(inference, memory_required + reserved)
-    return max(inference, minimum_required + reserved)
+    req = max(int(memory_required or 0), int(minimum_required or 0))
+    return max(inference, req + reserved)
 
 
 def _inference_memory_budget(args, kwargs):
@@ -140,7 +139,8 @@ def _trim_pass(model_management, device, target, requested, include_requested):
         if model.loaded_size() <= 0:
             continue
 
-        freed = int(model.partially_unload(model.offload_device, shortfall))
+        reclaim_amount = model.loaded_size() if not include_requested else shortfall
+        freed = int(model.partially_unload(model.offload_device, reclaim_amount))
         if freed > 0:
             reclaimed += freed
             trimmed += 1
@@ -157,17 +157,21 @@ def _trim_dynamic_boundary(model_management, models, target):
         if getattr(device, "type", None) != "xpu":
             continue
 
-        free_before = int(model_management.get_free_memory(device))
-        if free_before >= target:
-            continue
-
+        # Inactive dynamic models (not in requested) yield their VRAM to the
+        # active model entering execution, preventing cross-turn fragmentation.
         inactive_bytes, inactive_models = _trim_pass(
-            model_management, device, target, requested, False
+            model_management, device, float("inf"), requested, False
         )
-        active_bytes, active_models = _trim_pass(
-            model_management, device, target, requested, True
-        )
+        free_before = int(model_management.get_free_memory(device))
+        active_bytes = 0
+        active_models = 0
+        if free_before < target:
+            active_bytes, active_models = _trim_pass(
+                model_management, device, target, requested, True
+            )
         free_after = int(model_management.get_free_memory(device))
+        if inactive_models == 0 and active_models == 0:
+            continue
         log.info(
             "[OmniXPU] DynamicVRAM boundary trim: device=%s target=%.1fMiB "
             "free=%.1f->%.1fMiB reclaimed=%.1fMiB models=%d inactive/%d active",
