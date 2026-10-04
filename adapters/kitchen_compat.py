@@ -191,11 +191,18 @@ def apply():
     except ImportError:
         return False, "comfy_kitchen not available"
 
-    from omni_xpu_kernel import kitchen as omni_kitchen
-
     _DTYPE_CODE_TO_DTYPE.update(DTYPE_CODE_TO_DTYPE)
     convrot_registered = _register_convrot_dequant(omni_int8)
-    kitchen_ops = _register_ops(_KERNEL_KITCHEN_OPS, omni_kitchen)
+    try:
+        from omni_xpu_kernel import kitchen as omni_kitchen
+    except ImportError:
+        # 旧版 kernel 没有 kitchen 模块：只保留 convrot/int8 的既有能力。
+        omni_kitchen = None
+    kitchen_ops = (
+        _register_ops(_KERNEL_KITCHEN_OPS, omni_kitchen)
+        if omni_kitchen is not None
+        else []
+    )
     kitchen_ops += _register_ops(_KERNEL_INT8_OPS, omni_int8)
     if kitchen_ops:
         log.info("[OmniXPU] A770: registered Kitchen XPU ops: %s",
