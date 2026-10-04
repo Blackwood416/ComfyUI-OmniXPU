@@ -93,12 +93,12 @@ def _minimum_memory_target(model_management, args, kwargs):
     return max(inference, req + reserved)
 
 
-def _inference_memory_budget(args, kwargs):
+def _inference_memory_budget(model_management, args, kwargs):
     memory_required = _load_argument(args, kwargs, "memory_required", 0, 0)
     minimum_required = _minimum_memory_required_argument(args, kwargs)
-    if minimum_required is None:
-        return max(0, int(memory_required))
-    return max(0, int(minimum_required))
+    reserved = model_management.extra_reserved_memory()
+    req = max(int(memory_required or 0), int(minimum_required or 0))
+    return max(0, int(req + reserved))
 
 
 def _aimdo_budget_scope(models, budget):
@@ -194,7 +194,7 @@ def _patch_model_loader(model_management):
     def boundary_trimmed(models, *args, **kwargs):
         expanded = _expanded_models(models)
         target = _minimum_memory_target(model_management, args, kwargs)
-        inference_budget = _inference_memory_budget(args, kwargs)
+        inference_budget = _inference_memory_budget(model_management, args, kwargs)
         _trim_dynamic_boundary(model_management, expanded, target)
         budget_scope, budget_devices = _aimdo_budget_scope(
             expanded, inference_budget
