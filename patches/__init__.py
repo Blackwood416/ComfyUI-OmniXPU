@@ -197,6 +197,13 @@ COMPONENTS = (
         "A770 compatibility",
         "adapters/cast_buffer_lifetime.py",
     ),
+    Component(
+        "host_kv_cache_guard",
+        "host_kv_cache",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/host_kv_cache.py",
+    ),
 )
 
 

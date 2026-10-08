@@ -88,6 +88,10 @@ class Config:
             master
             and os.environ.get("OMNIXPU_CAST_BUFFER_LIFETIME", "1") != "0"
         )
+        self.host_kv_cache = (
+            master
+            and os.environ.get("OMNIXPU_HOST_KV_CACHE", "1") != "0"
+        )
 
 
 config = Config()
