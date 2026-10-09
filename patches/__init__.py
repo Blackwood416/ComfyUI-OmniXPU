@@ -204,6 +204,13 @@ COMPONENTS = (
         "ComfyUI-OmniXPU",
         "adapters/host_kv_cache.py",
     ),
+    Component(
+        "qwen21_cache_compat",
+        "qwen21_cache_compat",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/qwen21_cache_compat.py",
+    ),
 )
 
 

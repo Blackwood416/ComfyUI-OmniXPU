@@ -92,6 +92,10 @@ class Config:
             master
             and os.environ.get("OMNIXPU_HOST_KV_CACHE", "1") != "0"
         )
+        self.qwen21_cache_compat = (
+            master
+            and os.environ.get("OMNIXPU_QWEN21_CACHE_COMPAT", "1") != "0"
+        )
 
 
 config = Config()
