@@ -96,6 +96,14 @@ class Config:
             master
             and os.environ.get("OMNIXPU_QWEN21_CACHE_COMPAT", "1") != "0"
         )
+        self.minimax_compat = (
+            master
+            and os.environ.get("OMNIXPU_MINIMAX_COMPAT", "1") != "0"
+        )
+        self.moss_image_compat = (
+            master
+            and os.environ.get("OMNIXPU_MOSS_IMAGE_COMPAT", "1") != "0"
+        )
 
 
 config = Config()

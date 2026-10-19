@@ -211,6 +211,20 @@ COMPONENTS = (
         "ComfyUI-OmniXPU",
         "adapters/qwen21_cache_compat.py",
     ),
+    Component(
+        "minimax_compat",
+        "minimax_compat",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/minimax_compat.py",
+    ),
+    Component(
+        "moss_image_compat",
+        "moss_image_compat",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/moss_image_compat.py",
+    ),
 )
 
 

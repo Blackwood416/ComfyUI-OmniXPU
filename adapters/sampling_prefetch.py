@@ -37,10 +37,14 @@ def _is_minimax_h3(model_patcher):
 def _install_scope(comfy_samplers, model_management, model_prefetch):
     original_sample = comfy_samplers.CFGGuider.sample
     original_make_queue = model_prefetch.make_prefetch_queue
+    original_queue_pop = getattr(model_prefetch, "prefetch_queue_pop", None)
     state = {"active": False, "enabled": False}
+    block_counter = [0]
 
     def make_prefetch_queue(queue, device, transformer_options):
         global _logged
+        if state["enabled"]:
+            model_prefetch.cleanup_prefetch_queues()
         if state["active"] and not state["enabled"] and device.type == "xpu":
             # Entering the first sampling step: the diffusion model is fully
             # loaded, so the extra streams can no longer disturb model loading.
@@ -48,6 +52,7 @@ def _install_scope(comfy_samplers, model_management, model_prefetch):
             model_management.NUM_STREAMS = _STREAMS
             model_management.args.force_non_blocking = True
             state["enabled"] = True
+            block_counter[0] = 0
             if not _logged:
                 log.info(
                     "[OmniXPU] H3 sampling prefetch: %d non-blocking offload "
@@ -55,6 +60,13 @@ def _install_scope(comfy_samplers, model_management, model_prefetch):
                 )
                 _logged = True
         return original_make_queue(queue, device, transformer_options)
+
+    def prefetch_queue_pop(queue, device, module, *args, **kwargs):
+        if state["enabled"] and getattr(device, "type", None) == "xpu":
+            block_counter[0] += 1
+            if block_counter[0] % 10 == 0:
+                torch.xpu.current_stream(device).synchronize()
+        return original_queue_pop(queue, device, module, *args, **kwargs)
 
     @functools.wraps(original_sample)
     def sample(self, *args, **kwargs):
@@ -74,6 +86,7 @@ def _install_scope(comfy_samplers, model_management, model_prefetch):
                 torch.xpu.current_stream(device).synchronize()
                 for stream in model_management.STREAMS.get(device, ()):
                     stream.synchronize()
+                model_prefetch.cleanup_prefetch_queues()
             model_management.NUM_STREAMS = previous_streams
             model_management.args.force_non_blocking = previous_non_blocking
             state["active"] = False
@@ -82,6 +95,9 @@ def _install_scope(comfy_samplers, model_management, model_prefetch):
     setattr(make_prefetch_queue, _PATCH_MARKER, True)
     setattr(sample, _PATCH_MARKER, True)
     model_prefetch.make_prefetch_queue = make_prefetch_queue
+    if original_queue_pop is not None:
+        setattr(prefetch_queue_pop, _PATCH_MARKER, True)
+        model_prefetch.prefetch_queue_pop = prefetch_queue_pop
     comfy_samplers.CFGGuider.sample = sample
 
 
