@@ -42,6 +42,19 @@ try:
         patches = _load("patches", f"{_PKG}.patches")
 
         config_mod = sys.modules[f"{_PKG}.config"]
+
+        # Kitchen 0.2.40 XPU backend ported from xiangyuT/comfy-kitchen
+        # (dev/kitchen-0240-xpu-20261028): registers the XPU backend with
+        # comfy_kitchen when the optional package is present.
+        if os.environ.get("OMNIXPU_KITCHEN_BACKEND", "1") != "0":
+            try:
+                if _DIR not in sys.path:
+                    sys.path.insert(0, _DIR)
+                import omnixpu_kitchen_backend  # noqa: F401  (self-registers)
+                log.info("[OmniXPU] Kitchen XPU backend registered (plugin port)")
+            except Exception as _kitchen_exc:  # noqa: BLE001
+                log.warning("[OmniXPU] Kitchen XPU backend unavailable: %r", _kitchen_exc)
+
         patches.apply_all_patches(config_mod.config)
 
         # Load diagnostics node
