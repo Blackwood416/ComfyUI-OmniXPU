@@ -37,6 +37,18 @@ try:
         probe = _load("probe.py", f"{_PKG}.probe")
         probe.probe()
 
+        # ComfyUI 0.43.x requires comfy-kitchen>=0.2.40, whose published wheel
+        # has no XPU backend.  Graft the vendored one before any adapter probes
+        # comfy_kitchen.registry, so the historical two-component install keeps
+        # working without the separate comfy-kitchen-xpu-runtime provider.
+        try:
+            _kitchen_backend = _load(
+                "patches/kitchen_backend.py", f"{_PKG}.kitchen_backend"
+            )
+            _kitchen_backend.install()
+        except Exception as _graft_exc:  # noqa: BLE001 - never block startup
+            log.warning("[OmniXPU] Kitchen XPU graft unavailable: %s", _graft_exc)
+
         # Load config and patches
         _load("config.py", f"{_PKG}.config")
         patches = _load("patches", f"{_PKG}.patches")
