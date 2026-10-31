@@ -104,6 +104,10 @@ class Config:
             master
             and os.environ.get("OMNIXPU_MOSS_IMAGE_COMPAT", "1") != "0"
         )
+        self.qwen3vl_compat = (
+            master
+            and os.environ.get("OMNIXPU_QWEN3VL_COMPAT", "1") != "0"
+        )
         self.writable_weights = (
             master
             and os.environ.get("OMNIXPU_WRITABLE_WEIGHTS", "1") != "0"

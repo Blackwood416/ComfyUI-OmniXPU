@@ -226,6 +226,13 @@ COMPONENTS = (
         "adapters/moss_image_compat.py",
     ),
     Component(
+        "qwen3vl_compat",
+        "qwen3vl_compat",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/qwen3vl_compat.py",
+    ),
+    Component(
         "writable_weight_adapter",
         "writable_weights",
         "adapter",
