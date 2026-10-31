@@ -42,6 +42,31 @@ def _dispatch_details(module):
     }
 
 
+_INT8_LAYOUT_CACHE = []
+
+
+def _int8_layout_class(comfy_ops):
+    """Resolve ComfyUI's TensorWiseINT8Layout, which comfy.ops does not export.
+
+    The layout class is defined in comfy.quant_ops and never re-exported from
+    comfy.ops in any released ComfyUI, so reading it off comfy.ops alone leaves
+    the INT8 fast path permanently reporting ``int8_layout_unavailable``.
+    """
+    cached = _INT8_LAYOUT_CACHE
+    if cached:
+        return cached[0]
+    layout = getattr(comfy_ops, "TensorWiseINT8Layout", None)
+    if layout is None:
+        try:
+            import comfy.quant_ops as _quant_ops
+
+            layout = getattr(_quant_ops, "TensorWiseINT8Layout", None)
+        except Exception:
+            layout = None
+    cached.append(layout)
+    return layout
+
+
 def _int8_skip_reason(self, input, QuantizedTensor, TensorWiseINT8Layout):
     """Return why the INT8 fast forward did not take this call (or None)."""
     if not _INT8_FAST_FORWARD:
@@ -269,7 +294,7 @@ def apply():
     if hasattr(comfy_ops, "mixed_precision_ops"):
         _orig_mixed = comfy_ops.mixed_precision_ops
         QuantizedTensor = getattr(comfy_ops, "QuantizedTensor", None)
-        TensorWiseINT8Layout = getattr(comfy_ops, "TensorWiseINT8Layout", None)
+        TensorWiseINT8Layout = _int8_layout_class(comfy_ops)
 
         def _patched_mixed(*args, **kwargs):
             klass = _orig_mixed(*args, **kwargs)
