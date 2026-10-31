@@ -225,6 +225,20 @@ COMPONENTS = (
         "ComfyUI-OmniXPU",
         "adapters/moss_image_compat.py",
     ),
+    Component(
+        "writable_weight_adapter",
+        "writable_weights",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/writable_weights.py",
+    ),
+    Component(
+        "xpu_ram_staging_adapter",
+        "xpu_ram_staging",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/xpu_ram_staging.py",
+    ),
 )
 
 

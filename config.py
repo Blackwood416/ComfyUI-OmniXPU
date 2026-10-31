@@ -104,6 +104,14 @@ class Config:
             master
             and os.environ.get("OMNIXPU_MOSS_IMAGE_COMPAT", "1") != "0"
         )
+        self.writable_weights = (
+            master
+            and os.environ.get("OMNIXPU_WRITABLE_WEIGHTS", "1") != "0"
+        )
+        self.xpu_ram_staging = (
+            master
+            and os.environ.get("OMNIXPU_XPU_RAM_STAGING", "1") != "0"
+        )
 
 
 config = Config()
