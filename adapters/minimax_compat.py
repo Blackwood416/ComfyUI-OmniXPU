@@ -10,7 +10,54 @@ _UNITS_MARKER = "_omnixpu_minimax_dynamic_units_compat"
 _TE_PATCH_MARKER = "_omnixpu_te_cpu_fallback"
 
 
+_PACK_MARKER = "_omnixpu_minimax_embed_pack_compat"
+
+
 def apply():
+    # 0. MiniMaxH3Model._embed_and_pack XPU boolean mask crash avoidance (PyTorch 2.15 XPU index_put bug)
+    try:
+        import comfy.ldm.minimax.model as mmm
+        target_cls = getattr(mmm, "MiniMaxH3Model", None) or getattr(mmm, "MiniMaxH3", None)
+        orig_pack = getattr(target_cls, "_embed_and_pack", None) if target_cls is not None else None
+        if orig_pack is not None and not getattr(orig_pack, _PACK_MARKER, False):
+            import inspect
+            import textwrap
+            src = textwrap.dedent(inspect.getsource(orig_pack))
+            needle_v = (
+                "        all_video_rows[~img_update] = cond_video_rows\n"
+                "        all_video_rows[img_update] = video_rows"
+            )
+            replacement_v = (
+                "        if device.type == \"xpu\":\n"
+                "            all_video_rows.index_copy_(0, torch.nonzero(~img_update).squeeze(1), cond_video_rows)\n"
+                "            all_video_rows.index_copy_(0, torch.nonzero(img_update).squeeze(1), video_rows)\n"
+                "        else:\n"
+                "            all_video_rows[~img_update] = cond_video_rows\n"
+                "            all_video_rows[img_update] = video_rows"
+            )
+            needle_a = (
+                "        all_audio_rows[~audio_update] = cond_audio_rows\n"
+                "        all_audio_rows[audio_update] = audio_rows"
+            )
+            replacement_a = (
+                "        if device.type == \"xpu\":\n"
+                "            all_audio_rows.index_copy_(0, torch.nonzero(~audio_update).squeeze(1), cond_audio_rows)\n"
+                "            all_audio_rows.index_copy_(0, torch.nonzero(audio_update).squeeze(1), audio_rows)\n"
+                "        else:\n"
+                "            all_audio_rows[~audio_update] = cond_audio_rows\n"
+                "            all_audio_rows[audio_update] = audio_rows"
+            )
+            if needle_v in src and needle_a in src:
+                src_mod = src.replace(needle_v, replacement_v).replace(needle_a, replacement_a)
+                g = mmm.__dict__.copy()
+                l = {}
+                exec(src_mod, g, l)
+                setattr(l["_embed_and_pack"], _PACK_MARKER, True)
+                target_cls._embed_and_pack = l["_embed_and_pack"]
+                log.info("[OmniXPU] MiniMax H3 _embed_and_pack safe XPU index_copy applied")
+    except Exception as exc:
+        log.warning("[OmniXPU] MiniMax H3 _embed_and_pack compat skipped: %s", exc)
+
     # 1. FinalLayer.forward compatibility for legacy 4-arg callers (e.g., TE-Speed-MiniMaxH3)
     try:
         import comfy.ldm.minimax.model as mmm
