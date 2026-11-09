@@ -212,6 +212,13 @@ COMPONENTS = (
         "adapters/qwen21_cache_compat.py",
     ),
     Component(
+        "qwen_image21_qkv_adapter",
+        "qwen_image21_qkv",
+        "adapter",
+        "ComfyUI-OmniXPU",
+        "adapters/qwen_image21_qkv.py",
+    ),
+    Component(
         "minimax_compat",
         "minimax_compat",
         "adapter",

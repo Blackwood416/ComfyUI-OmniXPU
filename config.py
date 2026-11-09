@@ -96,6 +96,10 @@ class Config:
             master
             and os.environ.get("OMNIXPU_QWEN21_CACHE_COMPAT", "1") != "0"
         )
+        self.qwen_image21_qkv = (
+            master
+            and os.environ.get("OMNIXPU_QWEN_IMAGE21_QKV", "0") == "1"
+        )
         self.minimax_compat = (
             master
             and os.environ.get("OMNIXPU_MINIMAX_COMPAT", "1") != "0"
