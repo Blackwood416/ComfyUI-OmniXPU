@@ -16,6 +16,27 @@ _DISABLED_VALUES = frozenset(("0", "disable", "disabled", "false", "no", "off"))
 _LOG = logging.getLogger("ComfyUI-OmniXPU")
 
 
+def _ensure_windows_ur_loader_alias() -> None:
+    """Intel oneAPI 2026.2 renamed ur_loader.dll to ur_loader_shared.dll, but
+    ur_win_proxy_loader.dll dynamically resolves 'ur_loader.dll'. Ensure the alias
+    exists in Library/bin so Unified Runtime and AIMDO hook initialize seamlessly."""
+    if sys.platform != "win32":
+        return
+    lib_bin = os.path.join(sys.prefix, "Library", "bin")
+    shared = os.path.join(lib_bin, "ur_loader_shared.dll")
+    target = os.path.join(lib_bin, "ur_loader.dll")
+    if os.path.isfile(shared) and not os.path.exists(target):
+        try:
+            import shutil
+            shutil.copyfile(shared, target)
+            _LOG.info("[OmniXPU] Created ur_loader.dll alias for oneAPI 2026.2 compatibility")
+        except Exception as exc:
+            _LOG.debug("[OmniXPU] Could not create ur_loader.dll alias: %s", exc)
+
+
+_ensure_windows_ur_loader_alias()
+
+
 def _fail(message: str) -> NoReturn:
     raise SystemExit(f"[OmniXPU] {_ENV_NAME}: {message}")
 
